@@ -14,6 +14,7 @@ from nohara_bot.config import APP_URL
 from nohara_bot.database import db
 from nohara_bot.fonts import FONT_MODES
 from nohara_bot.handlers.common import (
+    DIVIDER,
     BANNER_FIELDS,
     _args,
     _banner_key,
@@ -42,10 +43,13 @@ COMMAND_HELP = (
     "<code>/setfont small_caps_unicode</code> — default_html, small_caps_unicode, monospace_code, serif_bold_italic, italic_editorial\n"
     "<code>/setlang hi</code> — default language\n"
     "<code>/setwelcome text</code> (or <code>/setwelcome reset</code>)\n"
-    "<code>/setbanner start|catalog|wallet|stock</code> — photo/GIF with this caption (or reply to one) · <code>/delbanner NAME</code>\n"
+    "<code>/setstartimage</code> · <code>/setcatalogimage</code> · <code>/setwalletimage</code> · <code>/setstockimage</code> — photo/GIF with this caption (or reply to one). Remove: <code>/delstartimage</code> etc. Also <code>/setbanner NAME</code>\n"
     "<code>/addfsub -100XXXXXXXXXX [invite_link]</code> · <code>/removefsub -100XXXXXXXXXX</code> · <code>/fsublist</code>\n"
     "<code>/addmoney USER_ID 5</code> · <code>/removemoney USER_ID 5</code> (amounts in USD)"
 )
+
+
+PLATFORM_HELP = "\n\n<b>Platform (master bot)</b>\n<code>/clone BOT_TOKEN</code> · <code>/myclones</code> · <code>/deleteclone BOT_ID</code>"
 
 
 async def dashboard_text(bot_id: str, ctx: Ctx) -> str:
@@ -54,7 +58,7 @@ async def dashboard_text(bot_id: str, ctx: Ctx) -> str:
     gw = clone["gateways"]
     ok = lambda flag: "✅" if flag else "❌"  # noqa: E731
     return (
-        f"<b>Store Dashboard</b> — {html.escape(str(clone.get('bot_username', '')))}\n\n"
+        f"⚙️ <b>Store Dashboard</b> — {html.escape(str(clone.get('bot_username', '')))}\n{DIVIDER}\n"
         f"• Products: <b>{stats['products']}</b> | Users: <b>{stats['users']}</b> | "
         f"Paid orders: <b>{stats['orders']}</b> (delivered {stats['delivered']})\n"
         f"• DB channel: {ok(clone.get('db_channel_id'))} <code>{clone.get('db_channel_id') or 'not set'}</code>\n"
@@ -64,7 +68,7 @@ async def dashboard_text(bot_id: str, ctx: Ctx) -> str:
         f"• Banners: " + " ".join(f"{k} {ok((clone.get('ui_branding') or {}).get(f))}" for k, f in BANNER_FIELDS.items()) + "\n"
         f"• Force-sub channels: <b>{len(clone.get('fsub_channels', []))}</b>\n"
         f"• Font: <code>{clone.get('font_style')}</code> | Language: <code>{clone.get('default_language')}</code> | "
-        f"USD→INR: <code>{clone.get('usd_to_inr')}</code>\n\n" + COMMAND_HELP
+        f"USD→INR: <code>{clone.get('usd_to_inr')}</code>\n\n" + COMMAND_HELP + (PLATFORM_HELP if clone.get("is_master") else "")
     )
 
 
@@ -206,21 +210,29 @@ def _has_banner_media(msg: Optional[Message]) -> bool:
     return bool(msg and (msg.photo or msg.animation or msg.video))
 
 
+IMAGE_CMD_KEYS = {
+    "setstartimage": "start", "setcatalogimage": "catalog", "setwalletimage": "wallet", "setstockimage": "stock",
+    "delstartimage": "start", "delcatalogimage": "catalog", "delwalletimage": "wallet", "delstockimage": "stock",
+}
+
 BANNER_USAGE = (
-    "<b>Banner images</b>\n"
-    "Send a photo (or GIF/video) with the caption — or reply to one with —\n"
-    "<code>/setbanner start</code> — welcome / start screen\n"
-    "<code>/setbanner catalog</code> — product list &amp; product pages\n"
-    "<code>/setbanner wallet</code> — wallet screen\n"
-    "<code>/setbanner stock</code> — shown when a product is out of stock\n"
-    "Remove one with <code>/delbanner start</code> (same names)."
+    "<b>🖼 Banner / start images</b>\n"
+    "Send a photo (or GIF/video) with the caption — or reply to one with — any of these:\n"
+    "<code>/setstartimage</code> — welcome / start screen\n"
+    "<code>/setcatalogimage</code> — product list &amp; product pages\n"
+    "<code>/setwalletimage</code> — wallet screen\n"
+    "<code>/setstockimage</code> — shown when a product is out of stock\n"
+    "Same thing: <code>/setbanner start</code> · <code>/setimage catalog</code> (names: start, catalog, wallet, stock)\n"
+    "Remove: <code>/delstartimage</code> · <code>/delcatalogimage</code> · <code>/delwalletimage</code> · "
+    "<code>/delstockimage</code> or <code>/delbanner NAME</code>"
 )
 
 
 @owner_only
 async def cmd_setbanner(client: Client, message: Message, ctx: Ctx) -> None:
     args = _args(message)
-    key = _banner_key(args[0]) if args else None
+    cmd_name = (message.command[0] if message.command else "").lower()
+    key = IMAGE_CMD_KEYS.get(cmd_name) or (_banner_key(args[0]) if args else None)
     replied = message.reply_to_message
     source = message if _has_banner_media(message) else (replied if _has_banner_media(replied) else None)
     if not key or not source:
@@ -242,7 +254,8 @@ async def cmd_setbanner(client: Client, message: Message, ctx: Ctx) -> None:
 @owner_only
 async def cmd_delbanner(client: Client, message: Message, ctx: Ctx) -> None:
     args = _args(message)
-    key = _banner_key(args[0]) if args else None
+    cmd_name = (message.command[0] if message.command else "").lower()
+    key = IMAGE_CMD_KEYS.get(cmd_name) or (_banner_key(args[0]) if args else None)
     if not key:
         await message.reply_text("<b>Usage:</b> <code>/delbanner start|catalog|wallet|stock</code>")
         return
