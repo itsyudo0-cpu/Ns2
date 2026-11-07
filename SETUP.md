@@ -93,9 +93,21 @@ Master बॉट (जिसका टोकन आपने `MASTER_BOT_TOKEN` �
    (कीमत USD में; आख़िरी नंबर स्टॉक है, खाली छोड़ें तो unlimited)
 3. पेमेंट: `/setgateway oxapay API_KEY` और/या `/setgateway fampay UPI_ID`
 4. इमेज: फोटो भेजकर caption में `/setstartimage` (नीचे इमेज वाला हिस्सा देखें)
-5. सारे कमांड: `/help`
+5. सारे कमांड: `/admin` खोलकर 📖 Command Guide
 
 Master के मेन्यू में एक **🧬 "Create Your Own Bot"** बटन भी है। कोई भी उसे दबाकर बता सकता है कि अपना बॉट कैसे बनाए: @BotFather से टोकन लेकर master बॉट में `/clone BOT_TOKEN` भेजे। (`/myclones` और `/deleteclone BOT_ID` भी वहीं चलते हैं।)
+
+### Admin Panel (`/admin`) और फोल्डर
+**Master बॉट और हर clone बॉट, दोनों में** owner `/admin` भेजे (या मेन्यू का ⚙️ बटन दबाए) तो बटनों वाला **Admin Panel** खुलता है। इसमें ओवरव्यू (प्रोडक्ट, यूज़र, ऑर्डर), सेटअप चेकलिस्ट (✅/❌) और ये सेक्शन हैं:
+📦 Products (देखना और 🗑 हटाना, कन्फर्म के साथ) · 🗂 Folders · 💳 Payments (OxaPay/UPI चालू-बंद बटन) · 🖼 Images (कौन सी सेट है, हटाना) · 📡 Channels · 📢 Force-Sub · 🎨 Appearance (फ़ॉन्ट बटन से बदलें) · 👛 Wallet & Users · 📖 Command Guide · और master में 🧬 Clone Bots (सारे clone की लिस्ट)।
+जिन चीज़ों में टाइप करना पड़ता है (नाम, API key), वहाँ पैनल में ठीक वही कमांड लिखा मिलता है।
+
+**फोल्डर (कैटेगरी):** प्रोडक्ट को फोल्डर में रखें, ग्राहक पहले फोल्डर देखेगा, फिर उसके अंदर के प्रोडक्ट।
+- बनाएँ: `/addfolder Courses`
+- प्रोडक्ट सीधे फोल्डर में: फ़ाइल भेजकर caption में `/addproduct Python Course | 9.99 | 10 | Courses` (फोल्डर न हो तो अपने आप बन जाता है)
+- पुराना प्रोडक्ट हिलाएँ: `/setfolder PRODUCT_ID FOLDER_ID` (फोल्डर से निकालने के लिए `none`)
+- `/folders` लिस्ट देखें, `/delfolder FOLDER_ID` से हटाएँ (प्रोडक्ट बने रहते हैं और "Other products" में दिखते हैं)
+- कोई फोल्डर न हो तो पहले की तरह सीधी प्रोडक्ट लिस्ट दिखती है।
 
 ### कमांड मेन्यू अपने आप बनता है
 बॉट में "/" दबाने पर दिखने वाली कमांड की लिस्ट **अपने आप** सेट हो जाती है, @BotFather में `/setcommands` करने की ज़रूरत नहीं।
@@ -116,9 +128,14 @@ Clone का owner अपने बॉट में वही कमांड �
 | `/setcatalogimage` | प्रोडक्ट लिस्ट और प्रोडक्ट पेज |
 | `/setwalletimage` | वॉलेट स्क्रीन |
 | `/setstockimage` | जब प्रोडक्ट का स्टॉक खत्म हो |
+| `/setproductimage` | एक प्रोडक्ट का पेज (सेट न हो तो कैटलॉग वाली इमेज दिखती है) |
+| `/setoxapayimage` | Crypto (OxaPay) पेमेंट स्क्रीन (सेट न हो तो वॉलेट वाली इमेज) |
+| `/setfampayimage` | UPI / FamPay पेमेंट स्क्रीन (सेट न हो तो वॉलेट वाली इमेज) |
 
 वही काम इन तरीकों से भी: `/setbanner start`, `/setimage catalog` (नाम: start, catalog, wallet, stock)।
-हटाने के लिए: `/delstartimage`, `/delcatalogimage`, `/delwalletimage`, `/delstockimage` या `/delbanner NAME`।
+हटाने के लिए: `/delstartimage`, `/delcatalogimage`, `/delwalletimage`, `/delstockimage`, `/delproductimage`, `/deloxapayimage`, `/delfampayimage` या `/delbanner NAME`।
+
+**तैयार इमेज** `nohara_images` फोल्डर में हैं (`banner_start.png`, `banner_catalog.png`, `banner_product.png`, `banner_wallet.png`, `banner_stock.png`, `banner_oxapay.png`, `banner_fampay.png`, और `logo.png`)। हर इमेज को अपने बॉट की चैट में **Photo** (File नहीं) के रूप में भेजें और caption में ऊपर वाला कमांड लिखें, जैसे `banner_start.png` पर `/setstartimage`।
 `/setwelcome आपका टेक्स्ट` से वेलकम का लिखा संदेश बदलें। इमेज के नीचे का टेक्स्ट 1000 अक्षरों तक होना चाहिए, वरना बिना इमेज के टेक्स्ट भेजा जाता है।
 
 ## 6) रंगीन बटन और प्रीमियम UI (Telegram के असली colored buttons)
