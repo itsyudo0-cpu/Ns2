@@ -83,7 +83,9 @@ async def _with_markup(token: str, method: str, payload: Dict[str, Any], markup:
     try:
         return await call(token, method, body)
     except BotApiError as exc:
-        if markup and has_style(markup) and exc.code == 400:
+        desc = exc.description.lower()
+        harmless = ("not modified", "not found", "chat", "forbidden", "message to")
+        if markup and has_style(markup) and exc.code == 400 and not any(h in desc for h in harmless):
             log.warning("Styled keyboard rejected (%s) — retrying without colours", exc.description)
             body["reply_markup"] = strip_styles(markup)
             return await call(token, method, body)
@@ -108,3 +110,8 @@ async def copy_message(
         payload["caption"] = caption
         payload["parse_mode"] = "HTML"
     return await _with_markup(token, "copyMessage", payload, markup)
+
+
+async def edit_message_text(token: str, chat_id: int, message_id: int, text: str, markup: Optional[Dict[str, Any]] = None) -> Any:
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    return await _with_markup(token, "editMessageText", payload, markup)
