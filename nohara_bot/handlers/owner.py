@@ -13,6 +13,7 @@ from typing import Optional
 from nohara_bot.config import APP_URL
 from nohara_bot.database import db
 from nohara_bot.fonts import FONT_MODES
+from nohara_bot.handlers.admin import screen_home
 from nohara_bot.handlers.common import (
     DIVIDER,
     BANNER_FIELDS,
@@ -23,6 +24,7 @@ from nohara_bot.handlers.common import (
 )
 from nohara_bot.i18n import SUPPORTED_LANG_CODES
 from nohara_bot.services.core import (
+    send_ui,
     Ctx,
     fmt_usd,
     parse_usd_to_cents,
@@ -30,51 +32,11 @@ from nohara_bot.services.core import (
 )
 
 
-COMMAND_HELP = (
-    "<b>Owner commands</b>\n"
-    "<code>/setdbchannel -100XXXXXXXXXX</code> — private channel that stores your files\n"
-    "<code>/setlogchannel -100XXXXXXXXXX</code> — channel for order logs\n"
-    "<code>/addproduct Title | 9.99 | 10</code> — send with a file (or reply to a file). Stock optional (empty = unlimited)\n"
-    "<code>/products</code> · <code>/delproduct ID</code>\n"
-    "<code>/setgateway oxapay API_KEY</code> · <code>/setgateway oxapay off</code>\n"
-    "<code>/setgateway fampay UPI_ID</code> · <code>/setgateway fampay off</code>\n"
-    "<code>/setgateway fampay_secret SECRET</code> — only for the optional UPI webhook\n"
-    "<code>/setrate 88</code> — USD → INR rate\n"
-    "<code>/setfont small_caps_unicode</code> — default_html, small_caps_unicode, monospace_code, serif_bold_italic, italic_editorial\n"
-    "<code>/setlang hi</code> — default language\n"
-    "<code>/setwelcome text</code> (or <code>/setwelcome reset</code>)\n"
-    "<code>/setstartimage</code> · <code>/setcatalogimage</code> · <code>/setwalletimage</code> · <code>/setstockimage</code> — photo/GIF with this caption (or reply to one). Remove: <code>/delstartimage</code> etc. Also <code>/setbanner NAME</code>\n"
-    "<code>/addfsub -100XXXXXXXXXX [invite_link]</code> · <code>/removefsub -100XXXXXXXXXX</code> · <code>/fsublist</code>\n"
-    "<code>/addmoney USER_ID 5</code> · <code>/removemoney USER_ID 5</code> (amounts in USD)"
-)
-
-
-PLATFORM_HELP = "\n\n<b>Platform (master bot)</b>\n<code>/clone BOT_TOKEN</code> · <code>/myclones</code> · <code>/deleteclone BOT_ID</code>"
-
-
-async def dashboard_text(bot_id: str, ctx: Ctx) -> str:
-    clone = await db.get_clone(bot_id) or ctx.clone
-    stats = await db.get_stats(bot_id)
-    gw = clone["gateways"]
-    ok = lambda flag: "✅" if flag else "❌"  # noqa: E731
-    return (
-        f"⚙️ <b>Store Dashboard</b> — {html.escape(str(clone.get('bot_username', '')))}\n{DIVIDER}\n"
-        f"• Products: <b>{stats['products']}</b> | Users: <b>{stats['users']}</b> | "
-        f"Paid orders: <b>{stats['orders']}</b> (delivered {stats['delivered']})\n"
-        f"• DB channel: {ok(clone.get('db_channel_id'))} <code>{clone.get('db_channel_id') or 'not set'}</code>\n"
-        f"• Log channel: {ok(clone.get('log_channel_id'))} <code>{clone.get('log_channel_id') or 'not set'}</code>\n"
-        f"• OxaPay: {ok(gw['oxapay']['enabled'] and db.get_oxapay_key(clone))} | "
-        f"UPI: {ok(gw['fampay']['enabled'] and gw['fampay']['upi_id'])}\n"
-        f"• Banners: " + " ".join(f"{k} {ok((clone.get('ui_branding') or {}).get(f))}" for k, f in BANNER_FIELDS.items()) + "\n"
-        f"• Force-sub channels: <b>{len(clone.get('fsub_channels', []))}</b>\n"
-        f"• Font: <code>{clone.get('font_style')}</code> | Language: <code>{clone.get('default_language')}</code> | "
-        f"USD→INR: <code>{clone.get('usd_to_inr')}</code>\n\n" + COMMAND_HELP + (PLATFORM_HELP if clone.get("is_master") else "")
-    )
-
-
 @owner_only
 async def cmd_dashboard(client: Client, message: Message, ctx: Ctx) -> None:
-    await message.reply_text(await dashboard_text(client.nohara_bot_id, ctx))
+    """/admin and /dashboard — open the button based Admin Panel."""
+    text, kb = await screen_home(ctx)
+    await send_ui(client, message.chat.id, text, kb)
 
 
 async def _set_channel(client: Client, message: Message, ctx: Ctx, kind: str) -> None:
@@ -212,6 +174,8 @@ def _has_banner_media(msg: Optional[Message]) -> bool:
 
 IMAGE_CMD_KEYS = {
     "setstartimage": "start", "setcatalogimage": "catalog", "setwalletimage": "wallet", "setstockimage": "stock",
+    "setproductimage": "product", "setoxapayimage": "oxapay", "setfampayimage": "fampay",
+    "delproductimage": "product", "deloxapayimage": "oxapay", "delfampayimage": "fampay",
     "delstartimage": "start", "delcatalogimage": "catalog", "delwalletimage": "wallet", "delstockimage": "stock",
 }
 
@@ -222,6 +186,9 @@ BANNER_USAGE = (
     "<code>/setcatalogimage</code> — product list &amp; product pages\n"
     "<code>/setwalletimage</code> — wallet screen\n"
     "<code>/setstockimage</code> — shown when a product is out of stock\n"
+    "<code>/setproductimage</code> — single product page (falls back to the catalog image)\n"
+    "<code>/setoxapayimage</code> — crypto (OxaPay) payment screen\n"
+    "<code>/setfampayimage</code> — UPI / FamPay payment screen\n"
     "Same thing: <code>/setbanner start</code> · <code>/setimage catalog</code> (names: start, catalog, wallet, stock)\n"
     "Remove: <code>/delstartimage</code> · <code>/delcatalogimage</code> · <code>/delwalletimage</code> · "
     "<code>/delstockimage</code> or <code>/delbanner NAME</code>"
@@ -263,12 +230,78 @@ async def cmd_delbanner(client: Client, message: Message, ctx: Ctx) -> None:
     await message.reply_text(f"✅ Banner <b>{key}</b> removed.")
 
 
+async def _resolve_folder(bot_id: str, ctx: Ctx, raw: str) -> str:
+    """Folder by id or name; an unknown name creates a new folder on the fly."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    for f in ctx.clone.get("folders") or []:
+        if raw == f["id"] or raw.lower() == f["name"].lower():
+            return f["id"]
+    return await db.add_folder(bot_id, raw[:40])
+
+
+@owner_only
+async def cmd_addfolder(client: Client, message: Message, ctx: Ctx) -> None:
+    name = _rest_of_text(message)[:40].strip()
+    if not name:
+        await message.reply_text("<b>Usage:</b> <code>/addfolder Folder Name</code>")
+        return
+    if any(f["name"].lower() == name.lower() for f in ctx.clone.get("folders") or []):
+        await message.reply_text("ℹ️ A folder with this name already exists. See /folders")
+        return
+    folder_id = await db.add_folder(client.nohara_bot_id, name)
+    await message.reply_text(
+        f"✅ Folder <b>{html.escape(name)}</b> created — ID <code>{folder_id}</code>\n"
+        f"Add a product to it: <code>/addproduct Title | 9.99 | 10 | {html.escape(name)}</code>\n"
+        f"Or move one: <code>/setfolder PRODUCT_ID {folder_id}</code>"
+    )
+
+
+@owner_only
+async def cmd_folders(client: Client, message: Message, ctx: Ctx) -> None:
+    folders = ctx.clone.get("folders") or []
+    if not folders:
+        await message.reply_text("No folders yet. Create one with <code>/addfolder Name</code>")
+        return
+    products = await db.list_products(client.nohara_bot_id)
+    lines = [
+        f"🗂 <b>{html.escape(f['name'])}</b> — {sum(1 for p in products if p.get('folder') == f['id'])} product(s) — <code>{f['id']}</code>"
+        for f in folders
+    ]
+    await message.reply_text("<b>Your folders</b>\n" + "\n".join(lines))
+
+
+@owner_only
+async def cmd_delfolder(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    if not args:
+        await message.reply_text("<b>Usage:</b> <code>/delfolder FOLDER_ID</code> (products are kept)")
+        return
+    deleted = await db.delete_folder(client.nohara_bot_id, args[0])
+    await message.reply_text("✅ Folder deleted. Its products are now under “Other products”." if deleted else "❌ Folder not found.")
+
+
+@owner_only
+async def cmd_setfolder(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    if len(args) < 2:
+        await message.reply_text("<b>Usage:</b> <code>/setfolder PRODUCT_ID FOLDER_ID</code> (use <code>none</code> to remove it from a folder)")
+        return
+    folder_id = "" if args[1].lower() == "none" else args[1]
+    if folder_id and folder_id not in {f["id"] for f in ctx.clone.get("folders") or []}:
+        await message.reply_text("❌ Folder not found. See /folders")
+        return
+    moved = await db.set_product_folder(client.nohara_bot_id, args[0], folder_id)
+    await message.reply_text("✅ Product moved." if moved else "❌ Product not found. See /products")
+
+
 @owner_only
 async def cmd_addproduct(client: Client, message: Message, ctx: Ctx) -> None:
     bot_id = client.nohara_bot_id
     usage = (
-        "<b>Usage:</b> send a file with the caption\n<code>/addproduct Title | 9.99 | 10</code>\n"
-        "(or reply to an already sent file with the same command). Price is in USD; stock is optional (empty = unlimited)."
+        "<b>Usage:</b> send a file with the caption\n<code>/addproduct Title | 9.99 | 10 | Folder</code>\n"
+        "(or reply to an already sent file with the same command). Price is in USD; stock and folder are optional (empty stock = unlimited; a new folder name is created automatically)."
     )
     parts = [p.strip() for p in _rest_of_text(message).split("|")]
     if len(parts) < 2 or not parts[0]:
@@ -297,6 +330,7 @@ async def cmd_addproduct(client: Client, message: Message, ctx: Ctx) -> None:
         await message.reply_text("Set your DB channel first: <code>/setdbchannel -100XXXXXXXXXX</code>")
         return
 
+    folder_id = await _resolve_folder(bot_id, ctx, parts[3]) if len(parts) >= 4 else ""
     product_id = uuid.uuid4().hex[:8]
     stored = await client.copy_message(
         chat_id=int(ctx.clone["db_channel_id"]),
@@ -304,10 +338,12 @@ async def cmd_addproduct(client: Client, message: Message, ctx: Ctx) -> None:
         message_id=source.id,
         caption=f"📦 <b>{html.escape(title)}</b>\n{fmt_usd(price_cents)} • ID <code>{product_id}</code>",
     )
-    await db.save_product(bot_id, product_id, title, price_cents, stock, stored.id)
+    await db.save_product(bot_id, product_id, title, price_cents, stock, stored.id, folder_id)
     await message.reply_text(
         f"✅ <b>Product saved</b>\n• {html.escape(title)}\n• Price: {fmt_usd(price_cents)}\n"
-        f"• Stock: {'unlimited' if stock == -1 else stock}\n• ID: <code>{product_id}</code>"
+        f"• Stock: {'unlimited' if stock == -1 else stock}\n"
+        + (f"• Folder: {html.escape(parts[3])}\n" if folder_id else "")
+        + f"• ID: <code>{product_id}</code>"
     )
     await send_audit(
         ctx.clone,
