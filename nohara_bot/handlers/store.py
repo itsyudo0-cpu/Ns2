@@ -21,7 +21,9 @@ from nohara_bot.buttons import (
 )
 from nohara_bot.config import APP_URL
 from nohara_bot.database import db
+from nohara_bot.handlers.menu import ensure_owner_menu
 from nohara_bot.handlers.common import (
+    DIVIDER,
     _is_owner,
     ensure_fsub,
     missing_fsub,
@@ -57,9 +59,11 @@ async def store_start(client: Client, message: Message) -> None:
     if not ctx:
         return
     await db.touch_user(bot_id, user_id)
+    if _is_owner(ctx, user_id):
+        spawn(ensure_owner_menu(client, bot_id, user_id, ctx.is_master))
     if not await ensure_fsub(client, ctx, message.chat.id, user_id):
         return
-    await show_home(client, ctx, message.chat.id, user_id)
+    await show_home(client, ctx, message.chat.id, user_id, name=message.from_user.first_name or "")
 
 
 async def store_changelang(client: Client, message: Message) -> None:
@@ -79,7 +83,7 @@ async def store_help(client: Client, message: Message) -> None:
     if _is_owner(ctx, message.from_user.id):
         await message.reply_text(await dashboard_text(client.nohara_bot_id, ctx))
     else:
-        await show_home(client, ctx, message.chat.id, message.from_user.id)
+        await show_home(client, ctx, message.chat.id, message.from_user.id, name=message.from_user.first_name or "")
 
 
 async def _append_to_message(msg: Optional[Message], suffix: str) -> None:
@@ -115,7 +119,7 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
             await db.set_user_lang(bot_id, user_id, parts[1])
             ctx = await get_ctx(bot_id, user_id) or ctx
             await query.answer(ctx.T("language_updated"))
-            await show_home(client, ctx, chat_id, user_id, replace=msg)
+            await show_home(client, ctx, chat_id, user_id, replace=msg, name=query.from_user.first_name or "")
             return
 
         if action == "fsub":
@@ -123,7 +127,7 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
                 await query.answer(ctx.T("fsub_required_msg"), show_alert=True)
                 return
             await query.answer()
-            await show_home(client, ctx, chat_id, user_id, replace=msg)
+            await show_home(client, ctx, chat_id, user_id, replace=msg, name=query.from_user.first_name or "")
             return
 
         if action == "cancel" and len(parts) == 2:
@@ -131,7 +135,7 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
             if order and order["user_id"] == user_id and order["bot_id"] == bot_id:
                 await db.cancel_order(order["_id"])
             await query.answer(ctx.T("order_cancelled"))
-            await show_home(client, ctx, chat_id, user_id, replace=msg)
+            await show_home(client, ctx, chat_id, user_id, replace=msg, name=query.from_user.first_name or "")
             return
 
         if action == "upi" and len(parts) == 3:
@@ -172,23 +176,31 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
 
     if target == "home":
         await query.answer()
-        await show_home(client, ctx, chat_id, user_id, replace=msg)
+        await show_home(client, ctx, chat_id, user_id, replace=msg, name=query.from_user.first_name or "")
 
     elif target == "products":
         await query.answer()
         products = await db.list_products(bot_id)
         if not products:
-            await show(client, ctx, chat_id, ctx.T("no_products"), back_keyboard(ctx.T, ctx.font), "catalog", msg)
+            empty = f"🛍 {ctx.H(ctx.T('collection_title'))}\n{DIVIDER}\n{html.escape(ctx.T('no_products'))}"
+            await show(client, ctx, chat_id, empty, back_keyboard(ctx.T, ctx.font), "catalog", msg)
             return
         kb = products_keyboard(products, ctx.T, ctx.font, fmt_usd)
-        await show(client, ctx, chat_id, ctx.H(ctx.T("products_title")), kb, "catalog", msg)
+        text = (
+            f"🛍 {ctx.H(ctx.T('collection_title'))}  <b>·</b>  {len(products)} {html.escape(ctx.T('items_label'))}\n"
+            f"{DIVIDER}\n<i>{html.escape(ctx.T('tap_to_view'))}</i>"
+        )
+        await show(client, ctx, chat_id, text, kb, "catalog", msg)
 
     elif target == "wallet":
         await query.answer()
         balance = await db.get_balance(bot_id, user_id)
-        text = f"{ctx.H(ctx.T('wallet_balance_label'))}\n\n💰 <b>{fmt_usd(balance)}</b>"
+        text = (
+            f"👛 {ctx.H(ctx.T('my_wallet'))}\n{DIVIDER}\n"
+            f"💰 {html.escape(ctx.T('balance_label'))}:  <b>{fmt_usd(balance)}</b>"
+        )
         if ctx.clone["gateways"]["fampay"]["enabled"]:
-            text += f"  (≈ ₹{cents_to_inr(balance, ctx.clone['usd_to_inr'])})"
+            text += f"\n🇮🇳 ≈ <b>₹{cents_to_inr(balance, ctx.clone['usd_to_inr'])}</b>"
         await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "wallet", msg)
 
     elif target == "lang":
@@ -201,6 +213,10 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
             return
         await query.answer()
         await show(client, ctx, chat_id, await dashboard_text(bot_id, ctx), back_keyboard(ctx.T, ctx.font), replace=msg)
+
+    elif target == "clone" and ctx.is_master:
+        await query.answer()
+        await show(client, ctx, chat_id, ctx.T("clone_info"), back_keyboard(ctx.T, ctx.font), "start", msg)
 
     else:
         await query.answer()
@@ -224,11 +240,14 @@ async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, produc
     price = f"<b>{fmt_usd(product['price_cents'])}</b>"
     if fampay_on:
         price += f"  (≈ ₹{cents_to_inr(product['price_cents'], ctx.clone['usd_to_inr'])})"
-    stock_text = ctx.T("unlimited_label") if product["stock"] == -1 else str(product["stock"])
+    stock_text = (
+        ctx.T("unlimited_label") if product["stock"] == -1 else f"{product['stock']} {ctx.T('left_label')}"
+    )
     text = (
-        f"{ctx.H(product['title'])}\n\n"
+        f"💎 {ctx.H(product['title'])}\n{DIVIDER}\n"
         f"💵 {html.escape(ctx.T('price_label'))}: {price}\n"
-        f"📦 {html.escape(ctx.T('stock_label'))}: <b>{stock_text}</b>"
+        f"📦 {html.escape(ctx.T('stock_label'))}: <b>{html.escape(stock_text)}</b>\n"
+        f"⚡ {html.escape(ctx.T('instant_delivery_line'))}"
     )
     if not in_stock:
         text += f"\n\n{html.escape(ctx.T('out_of_stock_msg'))}"
