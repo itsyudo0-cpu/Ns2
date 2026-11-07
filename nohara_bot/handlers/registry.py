@@ -7,6 +7,14 @@ from hydrogram import Client, filters
 from hydrogram.handlers import CallbackQueryHandler, MessageHandler
 
 from nohara_bot.handlers.owner import (
+    cmd_addcoupon,
+    cmd_broadcast,
+    cmd_coupons,
+    cmd_delcoupon,
+    cmd_setreferral,
+    cmd_settopupbonus,
+    cmd_setvip,
+    cmd_vipproduct,
     cmd_addfolder,
     cmd_delfolder,
     cmd_folders,
@@ -72,6 +80,14 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
     cmd("fsublist", cmd_fsublist)
     cmd("addmoney", cmd_addmoney)
     cmd("removemoney", cmd_removemoney)
+    cmd("broadcast", cmd_broadcast)
+    cmd("setvip", cmd_setvip)
+    cmd("setreferral", cmd_setreferral)
+    cmd("settopupbonus", cmd_settopupbonus)
+    cmd("addcoupon", cmd_addcoupon)
+    cmd("delcoupon", cmd_delcoupon)
+    cmd("coupons", cmd_coupons)
+    cmd("vipproduct", cmd_vipproduct)
 
     client.add_handler(CallbackQueryHandler(store_callback))
     client.add_handler(
@@ -80,3 +96,4 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
             private & (filters.text | filters.photo | filters.document) & ~filters.regex(r"^/"),
         )
     )
+    
