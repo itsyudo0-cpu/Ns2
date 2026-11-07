@@ -159,6 +159,10 @@ class Ctx:
         return style_html(text, self.font)
 
     @property
+    def is_master(self) -> bool:
+        return bool(self.clone.get("is_master"))
+
+    @property
     def owner_id(self) -> int:
         return int(self.clone["owner_id"])
 
