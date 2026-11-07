@@ -189,9 +189,10 @@ BANNER_USAGE = (
     "<code>/setproductimage</code> — single product page (falls back to the catalog image)\n"
     "<code>/setoxapayimage</code> — crypto (OxaPay) payment screen\n"
     "<code>/setfampayimage</code> — UPI / FamPay payment screen\n"
-    "Same thing: <code>/setbanner start</code> · <code>/setimage catalog</code> (names: start, catalog, wallet, stock)\n"
+    "Same thing: <code>/setbanner start</code> · <code>/setimage catalog</code> (names: start, catalog, wallet, stock, product, oxapay, fampay)\n"
     "Remove: <code>/delstartimage</code> · <code>/delcatalogimage</code> · <code>/delwalletimage</code> · "
-    "<code>/delstockimage</code> or <code>/delbanner NAME</code>"
+    "<code>/delstockimage</code> · <code>/delproductimage</code> · <code>/deloxapayimage</code> · "
+    "<code>/delfampayimage</code> or <code>/delbanner NAME</code>"
 )
 
 
@@ -204,6 +205,9 @@ async def cmd_setbanner(client: Client, message: Message, ctx: Ctx) -> None:
     source = message if _has_banner_media(message) else (replied if _has_banner_media(replied) else None)
     if not key or not source:
         await message.reply_text(BANNER_USAGE)
+        return
+    if key not in BANNER_FIELDS:
+        await message.reply_text(f"❌ Unknown banner name: <code>{html.escape(str(key))}</code>\n\n" + BANNER_USAGE)
         return
     if not ctx.clone.get("db_channel_id"):
         await message.reply_text("Set your DB channel first: <code>/setdbchannel -100XXXXXXXXXX</code>")
@@ -224,7 +228,10 @@ async def cmd_delbanner(client: Client, message: Message, ctx: Ctx) -> None:
     cmd_name = (message.command[0] if message.command else "").lower()
     key = IMAGE_CMD_KEYS.get(cmd_name) or (_banner_key(args[0]) if args else None)
     if not key:
-        await message.reply_text("<b>Usage:</b> <code>/delbanner start|catalog|wallet|stock</code>")
+        await message.reply_text("<b>Usage:</b> <code>/delbanner start|catalog|wallet|stock|product|oxapay|fampay</code>")
+        return
+    if key not in BANNER_FIELDS:
+        await message.reply_text(f"❌ Unknown banner name: <code>{html.escape(str(key))}</code>")
         return
     await db.update_clone_fields(client.nohara_bot_id, {f"ui_branding.{BANNER_FIELDS[key]}": 0})
     await message.reply_text(f"✅ Banner <b>{key}</b> removed.")
@@ -457,3 +464,4 @@ async def cmd_addmoney(client: Client, message: Message, ctx: Ctx) -> None:
 @owner_only
 async def cmd_removemoney(client: Client, message: Message, ctx: Ctx) -> None:
     await _money_command(client, message, ctx, add=False)
+        
