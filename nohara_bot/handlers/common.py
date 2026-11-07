@@ -29,11 +29,21 @@ BANNER_FIELDS = {
     "catalog": "catalog_photo_message_id",
     "wallet": "wallet_photo_message_id",
     "stock": "out_of_stock_photo_message_id",
+    "product": "product_photo_message_id",
+    "oxapay": "oxapay_photo_message_id",
+    "fampay": "fampay_photo_message_id",
+}
+# If a banner is not set, show this one instead.
+BANNER_FALLBACKS = {
+    "product": "catalog",
+    "oxapay": "wallet",
+    "fampay": "wallet",
 }
 BANNER_ALIASES = {
     "welcome": "start", "home": "start",
     "products": "catalog", "shop": "catalog", "store": "catalog",
     "outofstock": "stock", "out_of_stock": "stock", "soldout": "stock",
+    "item": "product", "crypto": "oxapay", "upi": "fampay",
 }
 
 
@@ -79,8 +89,12 @@ async def show(
             await replace.delete()
         except Exception:
             pass
+    branding = ctx.clone.get("ui_branding") or {}
     field = BANNER_FIELDS.get(banner or "", "")
-    banner_msg_id = int((ctx.clone.get("ui_branding") or {}).get(field, 0)) if field else 0
+    banner_msg_id = int(branding.get(field) or 0) if field else 0
+    if not banner_msg_id and banner in BANNER_FALLBACKS:
+        fb_field = BANNER_FIELDS.get(BANNER_FALLBACKS[banner], "")
+        banner_msg_id = int(branding.get(fb_field) or 0) if fb_field else 0
     if banner_msg_id and ctx.clone.get("db_channel_id") and len(text) <= 1000:
         try:
             await copy_ui(client, chat_id, int(ctx.clone["db_channel_id"]), banner_msg_id, text, kb)
@@ -160,3 +174,4 @@ def owner_only(func):
 
     wrapper.__name__ = func.__name__
     return wrapper
+    
