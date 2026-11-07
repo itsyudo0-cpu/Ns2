@@ -7,8 +7,10 @@ and manage it with buttons. (Things that need typing — a name, an API key — 
 command to send.)
 """
 
+import asyncio
 import html
-from typing import Any, Dict, List, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from hydrogram.types import CallbackQuery
 
@@ -17,7 +19,17 @@ from nohara_bot.buttons import btn, markup
 from nohara_bot.database import db
 from nohara_bot.fonts import FONT_MODES
 from nohara_bot.handlers.common import BANNER_FIELDS, DIVIDER, _is_owner, show
-from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, Ctx, fmt_usd
+from nohara_bot.services.core import (
+    ACTIVE_CLONE_CLIENTS,
+    Ctx,
+    fmt_date,
+    fmt_usd,
+    referral_cfg,
+    send_ui,
+    spawn,
+    topup_tiers,
+    vip_cfg,
+)
 
 FONT = "default_html"
 Screen = Tuple[str, Dict[str, Any]]
@@ -28,6 +40,25 @@ def B(text: str, cb: str, style: str = "success") -> Dict[str, Any]:
 
 
 BACK = [B("◀️ Admin Panel", "adm:home")]
+
+# (bot_id, user_id) -> "updates" | "support": the owner pressed "Set link" and the next text message is the link
+ADMIN_WAIT: Dict[Tuple[str, int], str] = {}
+LINK_LABELS = {"updates": "Updates channel", "support": "Support"}
+
+
+def normalize_link(raw: str) -> Optional[str]:
+    """@name / t.me/name / https://… -> a valid https URL, or None when it does not look like a link."""
+    text = (raw or "").strip()
+    if not text or len(text) > 200 or any(ch.isspace() for ch in text):
+        return None
+    if text.startswith("@"):
+        name = text[1:]
+        return f"https://t.me/{name}" if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", name) else None
+    if re.match(r"^(t\.me|telegram\.me)/", text, re.I):
+        text = "https://" + text
+    if re.match(r"^https?://[^\s/]+\.[^\s/]+", text, re.I):
+        return text
+    return None
 
 
 def ok(flag: Any) -> str:
@@ -56,6 +87,11 @@ ADMIN_GUIDE = (
     "/setstartimage · /setcatalogimage · /setproductimage · /setwalletimage · /setstockimage · "
     "/setoxapayimage · /setfampayimage — send a photo with the command as caption\n"
     "/delbanner <code>NAME</code> · /setfont <code>MODE</code> · /setlang <code>hi</code> · /setwelcome <code>text</code>\n\n"
+    "<b>VIP &amp; rewards</b>\n"
+    "/setvip <code>PRICE DAYS DISCOUNT%</code> · /setreferral <code>BONUS_USD</code> · /settopupbonus <code>10:5 25:10</code>\n"
+    "/addcoupon <code>CODE PERCENT [MAX_USES] [DAYS]</code> · /delcoupon <code>CODE</code> · /coupons · /vipproduct <code>ID on|off</code>\n\n"
+    "<b>Broadcast (free)</b>\n"
+    "/broadcast <code>text</code> — or reply to any message with /broadcast\n\n"
     "<b>Users &amp; wallet</b>\n"
     "/addmoney <code>USER_ID 5</code> · /removemoney <code>USER_ID 5</code> (USD)\n"
     "/addfsub <code>-100…</code> · /removefsub <code>-100…</code> · /fsublist"
@@ -97,7 +133,8 @@ async def screen_home(ctx: Ctx) -> Screen:
     ]
     if clone.get("is_master"):
         rows.append([B("🧬 Clone Bots", "adm:clones", "primary")])
-    rows.append([B("📖 Command Guide", "adm:help")])
+    rows.append([B("📣 Broadcast", "adm:bc", "primary"), B("💎 VIP & Rewards", "adm:premium", "primary")])
+    rows.append([B("🔗 Links", "adm:links", "primary"), B("📖 Command Guide", "adm:help")])
     rows.append([B("🏠 Back to Store", "menu:home")])
     return text, markup(rows)
 
@@ -155,6 +192,7 @@ async def screen_pay(ctx: Ctx) -> Screen:
         f"🪙 <b>Crypto (OxaPay)</b>\n   Key saved: {ok(ox_key)}   Live: {ok(gw['oxapay']['enabled'] and ox_key)}\n"
         f"🇮🇳 <b>UPI / FamPay</b>\n   UPI ID: {('<code>' + esc(upi) + '</code>') if upi else '❌'}   Live: {ok(gw['fampay']['enabled'] and upi)}\n"
         f"👛 <b>Wallet</b>  always on\n"
+        f"💰 Customers can top up their wallet with the live methods above.\n"
         f"💱 Rate: 1 USD = ₹{clone.get('usd_to_inr')}\n\n"
         f"<b>Set up</b>\n<code>/setgateway oxapay API_KEY</code>\n<code>/setgateway fampay UPI_ID</code>\n<code>/setrate 88</code>"
     )
@@ -265,93 +303,131 @@ async def screen_clones(ctx: Ctx) -> Screen:
     return text, markup([BACK])
 
 
-async def screen_help(ctx: Ctx) -> Screen:
-    return ADMIN_GUIDE + (PLATFORM_GUIDE if ctx.is_master else ""), markup([BACK])
+async def screen_links(ctx: Ctx) -> Screen:
+    links = ctx.clone.get("links") or {}
+    up, sp = links.get("updates_url") or "", links.get("support_url") or ""
+    text = (
+        f"🔗 <b>LINKS</b>\n{DIVIDER}\n"
+        f"{ok(up)} <b>Updates channel</b>  {esc(up) if up else 'not set'}\n"
+        f"{ok(sp)} <b>Support</b>  {esc(sp) if sp else 'not set'}\n\n"
+        f"These two buttons appear on the main menu, under <b>Top Up</b>. A button is shown only when its link is set.\n"
+        f"<i>Accepted: https://t.me/yourchannel · t.me/yourchannel · @username</i>"
+    )
+    rows = [[B("✏️ Set Updates link", "adm:linkset:updates", "primary"), B("✏️ Set Support link", "adm:linkset:support", "primary")]]
+    removers = []
+    if up:
+        removers.append(B("🗑 Remove Updates", "adm:linkdel:updates", "danger"))
+    if sp:
+        removers.append(B("🗑 Remove Support", "adm:linkdel:support", "danger"))
+    if removers:
+        rows.append(removers)
+    rows.append(BACK)
+    return text, markup(rows)
 
 
-SECTIONS = {
-    "home": screen_home, "products": screen_products, "folders": screen_folders, "pay": screen_pay,
-    "images": screen_images, "chan": screen_chan, "fsub": screen_fsub, "look": screen_look,
-    "wallet": screen_wallet, "clones": screen_clones, "help": screen_help,
-}
-
-
-# ═════════════════════════ Rendering & callbacks ═════════════════════════
-async def render(client, ctx: Ctx, query: CallbackQuery, text: str, kb: Dict[str, Any]) -> None:
-    """Edits the panel in place (smooth); falls back to a fresh message if that is not possible."""
-    msg = query.message
-    try:
-        await botapi.edit_message_text(client.nohara_token, msg.chat.id, msg.id, text, kb)
-    except botapi.BotApiError as exc:
-        if "not modified" in exc.description.lower():
-            return
-        await show(client, ctx, msg.chat.id, text, kb, replace=msg)
-    except Exception:
-        await show(client, ctx, msg.chat.id, text, kb, replace=msg)
-
-
-async def handle_admin_callback(client, query: CallbackQuery, ctx: Ctx, parts: List[str]) -> None:
-    user_id = query.from_user.id
-    if not _is_owner(ctx, user_id):
-        await query.answer(ctx.T("owner_only"), show_alert=True)
-        return
+async def handle_link_input(client, message, ctx: Ctx) -> bool:
+    """The owner pressed 'Set link' and now sends the link as a normal message. True = message was consumed."""
     bot_id = str(ctx.clone["_id"])
-    section = parts[1] if len(parts) > 1 else "home"
-    arg = parts[2] if len(parts) > 2 else ""
-    note = ""
-
-    if section == "pdel":  # confirmation screen
-        product = await db.get_product(bot_id, arg)
-        await query.answer()
-        if not product:
-            await render(client, ctx, query, *await screen_products(ctx))
-            return
-        text = f"🗑 <b>Delete this product?</b>\n{DIVIDER}\n<b>{esc(product['title'])}</b> — {fmt_usd(product['price_cents'])}\n<i>The file stays in your files channel.</i>"
-        kb = markup([[B("✅ Yes, delete", f"adm:pdelok:{arg}", "danger"), B("✖️ Cancel", "adm:products", "success")]])
-        await render(client, ctx, query, text, kb)
-        return
-
-    if section == "pdelok":
-        note = "Product deleted" if await db.delete_product(bot_id, arg) else "Not found"
-        section = "products"
-    elif section == "fdel":
-        note = "Folder deleted" if await db.delete_folder(bot_id, arg) else "Not found"
-        section = "folders"
-    elif section == "bdel" and arg in BANNER_FIELDS:
-        await db.update_clone_fields(bot_id, {f"ui_branding.{BANNER_FIELDS[arg]}": 0})
-        note = f"Image '{arg}' removed"
-        section = "images"
-    elif section == "fsubdel":
-        try:
-            note = "Channel removed" if await db.remove_fsub(bot_id, int(arg)) else "Not found"
-        except ValueError:
-            note = "Not found"
-        section = "fsub"
-    elif section == "font" and arg in FONT_MODES:
-        await db.update_clone_fields(bot_id, {"font_style": arg})
-        note = "Font updated"
-        section = "look"
-    elif section == "gw" and len(parts) == 4 and parts[2] in ("oxapay", "fampay") and parts[3] in ("on", "off"):
-        gateway, turn_on = parts[2], parts[3] == "on"
-        clone = await db.get_clone(bot_id) or ctx.clone
-        if turn_on and gateway == "oxapay" and not db.get_oxapay_key(clone):
-            await query.answer("Save the API key first:  /setgateway oxapay API_KEY", show_alert=True)
-            return
-        if turn_on and gateway == "fampay" and not clone["gateways"]["fampay"]["upi_id"]:
-            await query.answer("Save your UPI ID first:  /setgateway fampay UPI_ID", show_alert=True)
-            return
-        if gateway == "oxapay":
-            await db.set_oxapay(bot_id, enabled=turn_on)
-        else:
-            await db.set_fampay(bot_id, enabled=turn_on)
-        note = f"{'OxaPay' if gateway == 'oxapay' else 'UPI'} {'enabled' if turn_on else 'disabled'}"
-        section = "pay"
-
-    if section not in SECTIONS:
-        section = "home"
-    await query.answer(note or None)
+    key = (bot_id, message.from_user.id)
+    which = ADMIN_WAIT.get(key)
+    if not which:
+        return False
+    if not _is_owner(ctx, message.from_user.id):
+        ADMIN_WAIT.pop(key, None)
+        return False
+    url = normalize_link(message.text or "")
+    if not url:
+        await message.reply_text("❌ That does not look like a valid link.\nSend something like <code>https://t.me/yourchannel</code> or <code>@yourchannel</code>.")
+        return True
+    ADMIN_WAIT.pop(key, None)
+    await db.set_link(bot_id, which, url)
     fresh = await db.get_clone(bot_id)
+    await message.reply_text(f"✅ {LINK_LABELS[which]} link saved. It now shows on the main menu.")
     if fresh:
-        ctx = Ctx(fresh, ctx.lang)
-    text, kb = await SECTIONS[section](ctx)
-    await render(client, ctx, query, text, kb)
+        text, kb = await screen_links(Ctx(fresh, ctx.lang))
+        await send_ui(client, message.chat.id, text, kb)
+    return True
+
+
+# ═════════════════════════ Broadcast (free for every store) ═════════════════════════
+# (bot_id, owner_id) -> what will be sent after the owner confirms. Set by the /broadcast command.
+BC_PENDING: Dict[Tuple[str, int], Dict[str, Any]] = {}
+BC_RUNNING: set = set()
+_BLOCKED_ERRORS = {"UserIsBlocked", "InputUserDeactivated", "PeerIdInvalid", "UserDeactivated", "UserDeactivatedBan", "ChatWriteForbidden"}
+
+
+async def _send_one(client, user_id: int, source: Dict[str, Any]) -> str:
+    """'sent' | 'blocked' | 'failed'. Waits and retries once when Telegram asks us to slow down."""
+    for attempt in range(2):
+        try:
+            if source["kind"] == "copy":
+                await client.copy_message(user_id, source["chat_id"], source["message_id"])
+            else:
+                await client.send_message(user_id, source["text"])
+            return "sent"
+        except Exception as exc:  # noqa: BLE001
+            name = exc.__class__.__name__
+            if name == "FloodWait" and attempt == 0:
+                await asyncio.sleep(int(getattr(exc, "value", 5) or 5) + 1)
+                continue
+            return "blocked" if name in _BLOCKED_ERRORS else "failed"
+    return "failed"
+
+
+async def run_broadcast(client, bot_id: str, report_chat_id: int, source: Dict[str, Any]) -> None:
+    if bot_id in BC_RUNNING:
+        return
+    BC_RUNNING.add(bot_id)
+    counts = {"sent": 0, "blocked": 0, "failed": 0}
+    try:
+        user_ids = await db.list_user_ids(bot_id)
+        for uid in user_ids:
+            counts[await _send_one(client, uid, source)] += 1
+            await asyncio.sleep(0.05)  # ~20 messages / second, safely under Telegram's limits
+        await send_ui(
+            client, report_chat_id,
+            f"📣 <b>Broadcast finished</b>\n{DIVIDER}\n"
+            f"👥 Users: <b>{len(user_ids)}</b>\n✅ Delivered: <b>{counts['sent']}</b>\n"
+            f"🚫 Blocked the bot: <b>{counts['blocked']}</b>\n⚠️ Failed: <b>{counts['failed']}</b>",
+            markup([BACK]),
+        )
+    finally:
+        BC_RUNNING.discard(bot_id)
+
+
+# ═════════════════════════ Premium features screens ═════════════════════════
+async def screen_premium(ctx: Ctx) -> Screen:
+    clone = ctx.clone
+    vip, ref, tiers = vip_cfg(clone), referral_cfg(clone), topup_tiers(clone)
+    coupons = await db.list_coupons(str(clone["_id"]))
+    tier_text = " · ".join(f"{fmt_usd(int(t['min_cents']))}+ → {int(t['pct'])}%" for t in tiers) if tiers else "off"
+    text = (
+        f"💎 <b>VIP &amp; REWARDS</b>\n{DIVIDER}\n"
+        f"{ok(vip['enabled'])} <b>VIP membership</b>  {fmt_usd(vip['price_cents'])} / {vip['days']} days · {vip['discount_pct']}% off\n"
+        f"{ok(ref['enabled'])} <b>Referral</b>  bonus {fmt_usd(int(ref['bonus_cents']))} per invited friend\n"
+        f"{ok(tiers)} <b>Top-up bonus</b>  {tier_text}\n"
+        f"🎟 <b>Coupons</b>  {len(coupons)}\n\n"
+        f"<b>Change settings</b>\n"
+        f"/setvip <code>PRICE DAYS DISCOUNT%</code> — e.g. <code>/setvip 5 30 15</code>\n"
+        f"/setreferral <code>BONUS_USD</code> — e.g. <code>/setreferral 0.5</code>\n"
+        f"/settopupbonus <code>10:5 25:10 50:15</code> (USD:percent) · <code>off</code> · <code>default</code>\n"
+        f"/addcoupon <code>CODE PERCENT [MAX_USES] [DAYS]</code> · /delcoupon <code>CODE</code>\n"
+        f"/vipproduct <code>PRODUCT_ID on|off</code> — make a product VIP-only"
+    )
+    rows = [
+        [B("💎 VIP: ON" if vip["enabled"] else "💎 VIP: OFF", f"adm:vipsw:{'off' if vip['enabled'] else 'on'}", "danger" if vip["enabled"] else "success"),
+         B("🎁 Referral: ON" if ref["enabled"] else "🎁 Referral: OFF", f"adm:refsw:{'off' if ref['enabled'] else 'on'}", "danger" if ref["enabled"] else "success")],
+        [B("🎟 Coupons", "adm:coupons", "primary")],
+        BACK,
+    ]
+    return text, markup(rows)
+
+
+async def screen_coupons(ctx: Ctx) -> Screen:
+    coupons = await db.list_coupons(str(ctx.clone["_id"]))
+    lines = []
+    rows = []
+    for c in coupons[:20]:
+        exp = fmt_date(c["expires_at"]) if c.get("expires_at") else "never"
+        limit = c["max_uses"] if c.get("max_uses") else "∞"
+        lines.append(f"🎟 <code>{esc(c['cod
