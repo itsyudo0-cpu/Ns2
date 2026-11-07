@@ -90,14 +90,26 @@ async def show(
     await send_ui(client, chat_id, text, kb)
 
 
-def welcome_text(ctx: Ctx) -> str:
-    subtitle = ctx.clone.get("welcome_msg") or ctx.T("welcome_subtitle")
-    return f"{ctx.H(ctx.T('welcome_title'))}\n\n{html.escape(subtitle)}"
+DIVIDER = "━" * 18
 
 
-async def show_home(client: Client, ctx: Ctx, chat_id: int, user_id: int, replace: Optional[Message] = None) -> None:
-    kb = main_menu(ctx.T, ctx.font, _is_owner(ctx, user_id))
-    await show(client, ctx, chat_id, welcome_text(ctx), kb, "start", replace)
+def welcome_text(ctx: Ctx, name: str = "") -> str:
+    subtitle = ctx.clone.get("welcome_msg") or (
+        ctx.T("welcome_tagline") if ctx.lang in ("en", "hi") else ctx.T("welcome_subtitle")
+    )
+    lines = [f"✨ {ctx.H(ctx.T('welcome_title'))} ✨", DIVIDER]
+    if name:
+        lines.append(f"👋 <b>{ctx.T('greeting', name=html.escape(name))}</b>")
+        lines.append("")
+    lines += [f"<i>{html.escape(subtitle)}</i>", "", html.escape(ctx.T("trust_line")), DIVIDER]
+    return "\n".join(lines)
+
+
+async def show_home(
+    client: Client, ctx: Ctx, chat_id: int, user_id: int, replace: Optional[Message] = None, name: str = ""
+) -> None:
+    kb = main_menu(ctx.T, ctx.font, _is_owner(ctx, user_id), ctx.is_master)
+    await show(client, ctx, chat_id, welcome_text(ctx, name), kb, "start", replace)
 
 
 # ═════════════════════════════════════════════════════════════════════
