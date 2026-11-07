@@ -426,4 +426,30 @@ class NoharaDatabase:
         res = await self.coupons.delete_one({"bot_id": str(bot_id), "code": code.upper()})
         return res.deleted_count > 0
 
-    async def consume_coupon(self, bot_id: str, code: str, user_id:
+    async def consume_coupon(self, bot_id: str, code: str, user_id: int) -> None:
+        """Called after a discounted order was DELIVERED: counts the use and clears the user's active coupon."""
+        await self.coupons.update_one(
+            {"bot_id": str(bot_id), "code": code.upper()},
+            {"$inc": {"used": 1}, "$addToSet": {"used_by": int(user_id)}},
+        )
+        await self.users.update_one(
+            {"bot_id": str(bot_id), "user_id": int(user_id), "coupon.code": code.upper()},
+            {"$unset": {"coupon": ""}},
+        )
+
+    async def set_product_vip(self, bot_id: str, product_id: str, flag: bool) -> bool:
+        res = await self.products.update_one({"_id": product_id, "bot_id": str(bot_id)}, {"$set": {"vip_only": bool(flag)}})
+        return res.matched_count > 0
+
+    async def get_stats(self, bot_id: str) -> Dict[str, int]:
+        # wallet top-ups are stored as orders too (kind = "topup") but are not store sales
+        paid_filter = {"bot_id": str(bot_id), "kind": {"$ne": "topup"}, "status": {"$in": ["paid", "delivered", "refunded"]}}
+        return {
+            "products": await self.products.count_documents({"bot_id": str(bot_id)}),
+            "orders": await self.orders.count_documents(paid_filter),
+            "delivered": await self.orders.count_documents({"bot_id": str(bot_id), "kind": {"$ne": "topup"}, "status": "delivered"}),
+            "users": await self.count_users(bot_id),
+        }
+
+
+db = NoharaDatabase(MONGO_URI)
