@@ -436,48 +436,4 @@ EXTRA_STRINGS: Dict[str, Dict[str, str]] = {
         "pay_link_msg": "Tap the button below to pay. Your file is delivered automatically once the payment is confirmed.",
         "btn_open_payment": "Open Payment Page",
         "upi_instructions": "Pay <b>₹{amount}</b> to UPI ID <code>{upi}</code>, then send the UTR / transaction ID or a screenshot here.\nOrder ID: <code>{order_id}</code>",
-        "upi_proof_received": "Thanks! Your payment proof was sent to the store owner for verification.",
-        "upi_rejected": "Your payment could not be verified and the order was cancelled. Please contact the store owner.",
-        "out_of_stock_msg": "This product is currently out of stock.",
-        "gateway_error": "Could not create the payment right now. Please try again later.",
-        "delivery_failed_refund": "We could not deliver your file, so the amount was added to your wallet balance.",
-        "owner_only": "This command is only for the store owner.",
-        "something_wrong": "Something went wrong. Please try again."
-    },
-    "hi": {
-        "products_title": "उपलब्ध उत्पाद",
-        "no_products": "अभी कोई उत्पाद उपलब्ध नहीं है।",
-        "price_label": "कीमत",
-        "stock_label": "स्टॉक",
-        "unlimited_label": "असीमित",
-        "btn_back": "वापस",
-        "btn_home": "मुख्य मेनू",
-        "btn_joined": "मैंने जॉइन कर लिया",
-        "select_language": "अपनी भाषा चुनें",
-        "language_updated": "भाषा बदल दी गई।",
-        "order_cancelled": "ऑर्डर रद्द कर दिया गया।",
-        "pay_link_msg": "भुगतान के लिए नीचे का बटन दबाएँ। भुगतान की पुष्टि होते ही आपकी फ़ाइल अपने आप भेज दी जाएगी।",
-        "btn_open_payment": "पेमेंट पेज खोलें",
-        "upi_instructions": "UPI ID <code>{upi}</code> पर <b>₹{amount}</b> भेजें, फिर UTR / ट्रांज़ैक्शन ID या स्क्रीनशॉट यहाँ भेजें।\nऑर्डर ID: <code>{order_id}</code>",
-        "upi_proof_received": "धन्यवाद! आपका पेमेंट प्रूफ़ जाँच के लिए स्टोर मालिक को भेज दिया गया है।",
-        "upi_rejected": "आपका भुगतान सत्यापित नहीं हो सका और ऑर्डर रद्द कर दिया गया। कृपया स्टोर मालिक से संपर्क करें।",
-        "out_of_stock_msg": "यह उत्पाद अभी स्टॉक में नहीं है।",
-        "gateway_error": "अभी पेमेंट नहीं बन पाया। कृपया बाद में दोबारा कोशिश करें।",
-        "delivery_failed_refund": "हम आपकी फ़ाइल नहीं भेज पाए, इसलिए रकम आपके वॉलेट में जोड़ दी गई है।",
-        "owner_only": "यह कमांड सिर्फ़ स्टोर मालिक के लिए है।",
-        "something_wrong": "कुछ गड़बड़ हो गई। कृपया दोबारा कोशिश करें।"
-    },
-}
-
-
-def get_text(lang: str, key: str, custom_overrides: Optional[dict] = None) -> str:
-    """Priority: clone override -> language -> English -> key name."""
-    if custom_overrides:
-        override = (custom_overrides.get(lang) or {}).get(key)
-        if override:
-            return override
-    for code in (lang, "en"):
-        value = LOCALE_STRINGS.get(code, {}).get(key) or EXTRA_STRINGS.get(code, {}).get(key)
-        if value:
-            return value
-    return key
+        "upi_proof_received": "Thanks! Your payment proof was 
