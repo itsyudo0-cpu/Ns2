@@ -34,6 +34,11 @@ def _markup(rows: List[List[Button]]) -> Markup:
     return {"inline_keyboard": rows}
 
 
+# public names used by the admin panel
+btn = _btn
+markup = _markup
+
+
 def main_menu(T: Callable[..., str], font: str, is_owner: bool = False, is_master: bool = False) -> Markup:
     rows = [
         [_btn("🛍 " + T("btn_view_products"), font, "primary", "menu:products")],
@@ -46,12 +51,21 @@ def main_menu(T: Callable[..., str], font: str, is_owner: bool = False, is_maste
     return _markup(rows)
 
 
-def products_keyboard(products: List[Dict], T: Callable[..., str], font: str, price_fmt: Callable[[int], str]) -> Markup:
+def products_keyboard(products: List[Dict], T: Callable[..., str], font: str, price_fmt: Callable[[int], str], back_cb: str = "menu:home") -> Markup:
     rows = []
     for p in products:
         out = p["stock"] == 0
         label = f"{p['title']} — {price_fmt(p['price_cents'])}" + (" ✖" if out else "")
         rows.append([_btn(label, font, "danger" if out else "primary", f"prod:{p['_id']}")])
+    label = ("🏠 " + T("btn_home")) if back_cb == "menu:home" else ("◀️ " + T("btn_back"))
+    rows.append([_btn(label, font, "success", back_cb)])
+    return _markup(rows)
+
+
+def folders_keyboard(shown: List, other_count: int, T: Callable[..., str], font: str) -> Markup:
+    rows = [[_btn(f"🗂 {f['name']}  ({n})", font, "primary", f"fold:{f['id']}")] for f, n in shown]
+    if other_count:
+        rows.append([_btn(f"📦 {T('other_products')}  ({other_count})", font, "success", "fold:_")])
     rows.append([_btn("🏠 " + T("btn_home"), font, "success", "menu:home")])
     return _markup(rows)
 
@@ -63,6 +77,7 @@ def product_keyboard(
     in_stock: bool,
     oxapay_enabled: bool,
     fampay_enabled: bool,
+    back_cb: str = "menu:products",
 ) -> Markup:
     if not in_stock:
         return _markup([
@@ -78,7 +93,7 @@ def product_keyboard(
     if gateway_row:
         rows.append(gateway_row)
     rows.append([
-        _btn("◀️ " + T("btn_back"), font, "success", "menu:products"),
+        _btn("◀️ " + T("btn_back"), font, "success", back_cb),
         _btn("✖️ " + T("btn_cancel_order"), font, "danger", "menu:home"),
     ])
     return _markup(rows)
