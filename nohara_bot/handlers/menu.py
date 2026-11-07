@@ -68,6 +68,14 @@ OWNER_COMMANDS: List[Cmd] = [
     ("fsublist", "List force-subscribe channels"),
     ("addmoney", "Add wallet balance to a user"),
     ("removemoney", "Remove wallet balance from a user"),
+    ("broadcast", "Send a message to all your users (free)"),
+    ("setvip", "Set VIP price, days and discount"),
+    ("setreferral", "Set the referral bonus"),
+    ("settopupbonus", "Set the top-up bonus tiers"),
+    ("addcoupon", "Create a discount coupon"),
+    ("delcoupon", "Delete a coupon"),
+    ("coupons", "List your coupons"),
+    ("vipproduct", "Make a product VIP-only"),
 ]
 
 _OWNER_MENU_DONE: set = set()
@@ -118,3 +126,4 @@ async def ensure_owner_menu(client, bot_id: str, user_id: int, is_master: bool =
         return
     if await set_owner_menu(client, user_id, is_master):
         _OWNER_MENU_DONE.add(key)
+     
