@@ -87,17 +87,26 @@ class NoharaDatabase:
         )
         return await self.get_clone(bot_id)  # type: ignore[return-value]
 
+    async def ensure_master_store(self, bot_id: str, owner_id: int, bot_username: str) -> Dict[str, Any]:
+        """The MASTER bot is also a normal store (owner = first admin). Marked is_master, never booted as a clone."""
+        await self.register_clone(bot_id, owner_id, bot_username, "")
+        await self.clones.update_one(
+            {"_id": str(bot_id)},
+            {"$set": {"status": "master", "is_master": True, "owner_id": int(owner_id), "token_encrypted": ""}},
+        )
+        return await self.get_clone(bot_id)  # type: ignore[return-value]
+
     async def get_clone(self, bot_id: str) -> Optional[Dict[str, Any]]:
         return await self.clones.find_one({"_id": str(bot_id)})
 
     async def get_clones_by_owner(self, owner_id: int) -> List[Dict[str, Any]]:
-        return await self.clones.find({"owner_id": int(owner_id)}).to_list(length=100)
+        return await self.clones.find({"owner_id": int(owner_id), "is_master": {"$ne": True}}).to_list(length=100)
 
     async def get_running_clones(self) -> List[Dict[str, Any]]:
         return await self.clones.find({"status": "running"}).to_list(length=1000)
 
     async def count_clones(self) -> int:
-        return await self.clones.count_documents({})
+        return await self.clones.count_documents({"is_master": {"$ne": True}})
 
     @staticmethod
     def get_clone_token(clone: Dict[str, Any]) -> str:
