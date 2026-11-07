@@ -85,30 +85,44 @@ Nstore-main/                      <- ROOT फोल्डर
 5. **Keep-alive (ज़रूरी):** Render Free 15 मिनट बाद सो जाता है। UptimeRobot (free) में `https://आपका-app.onrender.com/healthz` को हर 5 मिनट पर ping करने के लिए लगा दें।
 
 ## 4) पहली बार इस्तेमाल
-**Master बॉट में:** `/clone BOT_TOKEN` (टोकन वाला मैसेज चैट से अपने आप डिलीट हो जाता है)
 
-**अपने नए store बॉट में (सिर्फ़ owner)**, पहले उसे `/start` ज़रूर करें:
-1. एक **private channel** बनाएँ, बॉट को **Admin** बनाएँ, फिर `/setdbchannel -100XXXXXXXXXX`
-2. (वैकल्पिक) लॉग channel: `/setlogchannel -100XXXXXXXXXX`
-3. प्रोडक्ट: फ़ाइल भेजें और caption में लिखें `/addproduct Course Name | 9.99 | 10`
+### A) Master बॉट = आपका अपना स्टोर (प्रोडक्ट यहीं बेचें)
+Master बॉट (जिसका टोकन आपने `MASTER_BOT_TOKEN` में डाला) अब आपका **अपना स्टोर** है। उसका owner वो पहली user ID है जो आपने `ADMIN_IDS` में लिखी (बाकी IDs भी owner की तरह चला सकती हैं)। उसमें ये करें:
+1. एक **private channel** बनाएँ, master बॉट को **Admin** बनाएँ, फिर master बॉट में `/setdbchannel -100XXXXXXXXXX`
+2. प्रोडक्ट: फ़ाइल भेजें और caption में लिखें `/addproduct Course Name | 9.99 | 10`
    (कीमत USD में; आख़िरी नंबर स्टॉक है, खाली छोड़ें तो unlimited)
-4. पेमेंट: `/setgateway oxapay API_KEY` और/या `/setgateway fampay UPI_ID`
+3. पेमेंट: `/setgateway oxapay API_KEY` और/या `/setgateway fampay UPI_ID`
+4. इमेज: फोटो भेजकर caption में `/setstartimage` (नीचे इमेज वाला हिस्सा देखें)
 5. सारे कमांड: `/help`
 
-## 5) इमेज (banner) फ़ीचर
-बॉट के हर स्क्रीन पर आप अपनी इमेज लगा सकते हैं। DB channel सेट होना चाहिए। **फोटो (या GIF/वीडियो) भेजें और caption में कमांड लिखें**, या किसी फोटो पर reply करके कमांड भेजें:
+Master के मेन्यू में एक **🧬 "Create Your Own Bot"** बटन भी है। कोई भी उसे दबाकर बता सकता है कि अपना बॉट कैसे बनाए: @BotFather से टोकन लेकर master बॉट में `/clone BOT_TOKEN` भेजे। (`/myclones` और `/deleteclone BOT_ID` भी वहीं चलते हैं।)
+
+### कमांड मेन्यू अपने आप बनता है
+बॉट में "/" दबाने पर दिखने वाली कमांड की लिस्ट **अपने आप** सेट हो जाती है, @BotFather में `/setcommands` करने की ज़रूरत नहीं।
+- **हर यूज़र** को: `/start`, `/changelang`, `/help` (हिंदी वालों को हिंदी विवरण के साथ)।
+- **सिर्फ़ बॉट के owner** को अपनी चैट में सारे एडमिन कमांड भी दिखते हैं (`/addproduct`, `/setgateway`, `/setstartimage` ...)।
+- **Master बॉट** में सबको `/clone`, `/myclones`, `/deleteclone` भी दिखते हैं।
+- ये नया बॉट clone होते ही, हर Render restart पर (पुराने clone भी ठीक हो जाते हैं), और owner के `/start` भेजने पर अपने आप लगता है। Telegram किसी का निजी मेन्यू तभी लेता है जब उसने बॉट खोला हो, इसलिए owner `/start` एक बार ज़रूर भेजे।
+
+### B) किसी का clone किया हुआ बॉट
+Clone का owner अपने बॉट में वही कमांड चलाता है (`/setdbchannel`, `/addproduct`, `/setgateway`, इमेज वाले कमांड, `/help`)। पहले उसे उस बॉट को `/start` करना होगा। उसके मेन्यू में Clone बटन नहीं दिखता, सिर्फ़ master में दिखता है।
+
+## 5) इमेज (start / banner) फ़ीचर
+हर स्क्रीन पर आप अपनी इमेज लगा सकते हैं (master और clone, दोनों में)। DB channel सेट होना चाहिए। **फोटो (या GIF/वीडियो) भेजें और caption में कमांड लिखें**, या किसी फोटो पर reply करके कमांड भेजें:
 
 | कमांड | कहाँ दिखेगी |
 |---|---|
-| `/setbanner start` | `/start` वेलकम स्क्रीन |
-| `/setbanner catalog` | प्रोडक्ट लिस्ट और प्रोडक्ट पेज |
-| `/setbanner wallet` | वॉलेट स्क्रीन |
-| `/setbanner stock` | जब प्रोडक्ट का स्टॉक खत्म हो |
+| `/setstartimage` | `/start` वेलकम स्क्रीन |
+| `/setcatalogimage` | प्रोडक्ट लिस्ट और प्रोडक्ट पेज |
+| `/setwalletimage` | वॉलेट स्क्रीन |
+| `/setstockimage` | जब प्रोडक्ट का स्टॉक खत्म हो |
 
-हटाने के लिए: `/delbanner start` (बाकी के नाम भी ऐसे ही)। `/setwelcome आपका टेक्स्ट` से वेलकम का लिखा हुआ संदेश बदलें। इमेज के नीचे का टेक्स्ट 1000 अक्षरों तक होना चाहिए, वरना बिना इमेज के टेक्स्ट भेजा जाता है।
+वही काम इन तरीकों से भी: `/setbanner start`, `/setimage catalog` (नाम: start, catalog, wallet, stock)।
+हटाने के लिए: `/delstartimage`, `/delcatalogimage`, `/delwalletimage`, `/delstockimage` या `/delbanner NAME`।
+`/setwelcome आपका टेक्स्ट` से वेलकम का लिखा संदेश बदलें। इमेज के नीचे का टेक्स्ट 1000 अक्षरों तक होना चाहिए, वरना बिना इमेज के टेक्स्ट भेजा जाता है।
 
-## 6) रंगीन बटन (Telegram के असली colored buttons)
-बटन अब इमोजी से नहीं, Telegram के **आधिकारिक style** से रंगीन हैं: `primary` नीला, `success` हरा, `danger` लाल। ये मैसेज Telegram के Bot API से जाते हैं (`botapi.py`), बाकी सब Hydrogram से।
+## 6) रंगीन बटन और प्रीमियम UI (Telegram के असली colored buttons)
+बटन इमोजी से नहीं, Telegram के **आधिकारिक style** से रंगीन हैं: `primary` नीला, `success` हरा, `danger` लाल। मेन्यू के सामान्य बटन (वॉलेट, भाषा, होम, बैक) अब **हरे** हैं, मुख्य बटन नीले और cancel/स्टॉक खत्म वाले लाल। हर स्क्रीन पर आइकन, डिवाइडर लाइन, नाम के साथ अभिवादन और ट्रस्ट लाइन है। ये मैसेज Telegram के Bot API से जाते हैं (`botapi.py`), बाकी सब Hydrogram से।
 - रंग देखने के लिए आपके Telegram ऐप का 2026 की शुरुआत के बाद का वर्ज़न होना चाहिए; पुराने ऐप में बटन सामान्य दिखते हैं।
 - अगर Telegram कभी style रिजेक्ट करे तो बॉट अपने आप बिना रंग के भेज देता है, बॉट नहीं रुकता।
 - बंद करने के लिए Render में `BUTTON_COLORS=false`।
