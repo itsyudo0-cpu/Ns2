@@ -10,8 +10,9 @@ NOHARA STORE BOT — Shared services (nohara_bot/services/core.py)
 import asyncio
 import html
 import logging
+import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from hydrogram import Client
 from hydrogram.enums import ParseMode
@@ -154,6 +155,18 @@ class Ctx:
                 return text
         return text
 
+    def TX(self, key: str, default: str, **kwargs: Any) -> str:
+        """Like T(), but uses `default` (English) when the key has no translation."""
+        text = get_text(self.lang, key, self.overrides)
+        if text == key:
+            text = default
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except (KeyError, IndexError, ValueError):
+                return text
+        return text
+
     def H(self, text: str) -> str:
         """Message-body font styling (HTML-safe)."""
         return style_html(text, self.font)
@@ -173,6 +186,107 @@ async def get_ctx(bot_id: str, user_id: int) -> Optional[Ctx]:
         return None
     lang = await db.get_user_lang(bot_id, user_id, clone.get("default_language", "en"))
     return Ctx(clone, lang)
+
+
+# ───────────────────────── Premium features: VIP · coupons · referral · top-up bonus ─────────────────────────
+# Every setting has a default, so old stores (created before these features) work without any migration.
+VIP_DEFAULTS = {"enabled": True, "price_cents": 500, "days": 30, "discount_pct": 15}
+REFERRAL_DEFAULTS = {"enabled": True, "bonus_cents": 50, "min_paid_cents": 100}
+TOPUP_BONUS_DEFAULT = [{"min_cents": 1000, "pct": 5}, {"min_cents": 2500, "pct": 10}, {"min_cents": 5000, "pct": 15}]
+
+
+def vip_cfg(clone: Dict[str, Any]) -> Dict[str, Any]:
+    return {**VIP_DEFAULTS, **(clone.get("vip") or {})}
+
+
+def referral_cfg(clone: Dict[str, Any]) -> Dict[str, Any]:
+    return {**REFERRAL_DEFAULTS, **(clone.get("referral") or {})}
+
+
+def topup_tiers(clone: Dict[str, Any]) -> List[Dict[str, int]]:
+    """[] = bonus switched off. Missing setting = the default tiers."""
+    tiers = clone.get("topup_bonus")
+    if tiers is None:
+        tiers = TOPUP_BONUS_DEFAULT
+    return sorted(tiers, key=lambda t: int(t["min_cents"]))
+
+
+def topup_bonus_cents(clone: Dict[str, Any], cents: int) -> int:
+    pct = 0
+    for tier in topup_tiers(clone):
+        if int(cents) >= int(tier["min_cents"]):
+            pct = int(tier["pct"])
+    return int(cents) * pct // 100
+
+
+def fmt_date(ts: int) -> str:
+    return time.strftime("%d %b %Y", time.gmtime(int(ts)))
+
+
+def coupon_is_valid(coupon: Optional[Dict[str, Any]], user_id: int) -> bool:
+    if not coupon:
+        return False
+    if coupon.get("expires_at") and int(coupon["expires_at"]) < int(time.time()):
+        return False
+    if coupon.get("max_uses") and int(coupon.get("used", 0)) >= int(coupon["max_uses"]):
+        return False
+    if int(user_id) in (coupon.get("used_by") or []):
+        return False
+    return True
+
+
+async def get_user_perks(clone: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    user = await db.get_user(str(clone["_id"]), user_id) or {}
+    vip_until = int(user.get("vip_until") or 0)
+    return {
+        "user": user,
+        "vip_until": vip_until,
+        "vip_active": bool(vip_cfg(clone)["enabled"] and vip_until > int(time.time())),
+    }
+
+
+async def price_for(clone: Dict[str, Any], perks: Dict[str, Any], user_id: int, product: Dict[str, Any]):
+    """Best single discount wins (VIP or coupon — they do not stack).
+    Returns (final_cents, {"pct", "source": 'vip'|'coupon'|'', "code", "list_cents"})."""
+    list_cents = int(product["price_cents"])
+    pct, source, code = 0, "", ""
+    if perks.get("vip_active"):
+        pct, source = int(vip_cfg(clone)["discount_pct"]), "vip"
+    active = (perks.get("user") or {}).get("coupon")
+    if active:
+        coupon = await db.get_coupon(str(clone["_id"]), active.get("code", ""))
+        if coupon_is_valid(coupon, user_id) and int(coupon["pct"]) > pct:
+            pct, source, code = int(coupon["pct"]), "coupon", coupon["code"]
+    final = list_cents - list_cents * pct // 100
+    return max(final, 1), {"pct": pct, "source": source, "code": code, "list_cents": list_cents}
+
+
+async def reward_referrer(bot_id: str, user_id: int, paid_cents: int) -> None:
+    """The first real payment of an invited friend pays the referrer a wallet bonus (once per friend)."""
+    try:
+        clone = await db.get_clone(bot_id)
+        if not clone:
+            return
+        cfg = referral_cfg(clone)
+        if not cfg["enabled"] or int(cfg["bonus_cents"]) <= 0 or int(paid_cents) < int(cfg["min_paid_cents"]):
+            return
+        doc = await db.claim_referral_reward(bot_id, user_id)
+        if not doc:
+            return
+        referrer_id, bonus = int(doc["referred_by"]), int(cfg["bonus_cents"])
+        await db.credit(bot_id, referrer_id, bonus)
+        await db.add_referral_stats(bot_id, referrer_id, bonus)
+        client = ACTIVE_CLONE_CLIENTS.get(str(bot_id))
+        if client:
+            try:
+                await client.send_message(
+                    referrer_id,
+                    f"🎁 <b>Referral bonus!</b>\n{fmt_usd(bonus)} was added to your wallet because a friend you invited just made a payment.",
+                )
+            except Exception:
+                pass
+    except Exception:
+        log.exception("Referral reward failed")
 
 
 # ───────────────────────── Audit & notifications ─────────────────────────
@@ -216,6 +330,39 @@ def _audit_line(title: str, clone: Dict[str, Any], order: Dict[str, Any], extra:
     )
 
 
+# ───────────────────────── Wallet top-up ─────────────────────────
+async def fulfill_topup(order: Dict[str, Any]) -> bool:
+    """Called ONCE per paid top-up order (after db.mark_paid): credits the buyer's wallet."""
+    bot_id = str(order["bot_id"])
+    user_id = int(order["user_id"])
+    cents = int(order["price_cents"])
+    clone = await db.get_clone(bot_id)
+    client = ACTIVE_CLONE_CLIENTS.get(bot_id)
+    ctx = await get_ctx(bot_id, user_id)
+
+    bonus = topup_bonus_cents(clone, cents) if clone else 0
+    balance = await db.credit(bot_id, user_id, cents + bonus)
+    await db.set_order_fields(order["_id"], status="delivered", bonus_cents=bonus)
+    if client:
+        try:
+            bonus_line = f"\n🎁 Bonus: <b>+{fmt_usd(bonus)}</b>" if bonus else ""
+            await client.send_message(
+                user_id,
+                f"✅ <b>Top-up successful</b>\n💰 {fmt_usd(cents)} added to your wallet.{bonus_line}\n👛 Balance: <b>{fmt_usd(balance)}</b>",
+            )
+        except Exception:
+            log.warning("Could not notify user %s about the top-up", user_id)
+    if clone:
+        await send_audit(
+            clone,
+            f"<b>[NOHARA AUDIT — WALLET TOP-UP]</b>\n"
+            f"• Clone Bot: <code>{html.escape(str(clone.get('bot_username', '')))}</code> (<code>{clone['_id']}</code>)\n"
+            f"• User: <code>{user_id}</code> | Amount: <b>{fmt_usd(cents)}</b> (+bonus {fmt_usd(bonus)}) | Method: <b>{order['method']}</b> | Order: <code>{order['_id']}</code>",
+        )
+    await reward_referrer(bot_id, user_id, cents)
+    return True
+
+
 # ───────────────────────── Delivery & refund ─────────────────────────
 async def fulfill_paid_order(order: Dict[str, Any], stock_reserved: bool = False) -> bool:
     """
@@ -224,6 +371,9 @@ async def fulfill_paid_order(order: Dict[str, Any], stock_reserved: bool = False
       2. copies the file from the owner's private DB channel to the buyer
       3. if anything fails -> the price is credited back to the buyer's wallet (no money is lost)
     """
+    if order.get("kind") == "topup":
+        return await fulfill_topup(order)
+
     bot_id = str(order["bot_id"])
     user_id = int(order["user_id"])
     clone = await db.get_clone(bot_id)
@@ -249,6 +399,9 @@ async def fulfill_paid_order(order: Dict[str, Any], stock_reserved: bool = False
 
     if delivered and clone:
         await db.set_order_fields(order["_id"], status="delivered")
+        if order.get("coupon"):
+            await db.consume_coupon(bot_id, order["coupon"], user_id)
+        await reward_referrer(bot_id, user_id, int(order["price_cents"]))
         await send_audit(clone, _audit_line("ORDER DELIVERED", clone, order, f"• DB Msg Pointer: <code>#{product['db_channel_message_id']}</code>"))
         return True
 
@@ -271,3 +424,4 @@ async def fulfill_paid_order(order: Dict[str, Any], stock_reserved: bool = False
         )
         await send_audit(clone, _audit_line("DELIVERY FAILED — REFUNDED", clone, order))
     return False
+    
