@@ -14,6 +14,7 @@ from typing import Any, Dict
 from nohara_bot.config import MASTER_AUDIT_CHANNEL_ID, MAX_CLONES_PER_USER, MAX_CLONES_TOTAL
 from nohara_bot.database import db
 from nohara_bot.handlers.common import _args, _is_admin
+from nohara_bot.handlers.menu import apply_command_menu
 from nohara_bot.handlers.registry import register_store_handlers
 from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, make_client
 
@@ -51,7 +52,8 @@ async def boot_clone(clone_doc: Dict[str, Any]) -> bool:
         log.error("Clone %s has no readable token (wrong ENCRYPTION_KEY?). Skipped.", bot_id)
         return False
     try:
-        await start_clone_client(bot_id, token)
+        clone_client = await start_clone_client(bot_id, token)
+        await apply_command_menu(clone_client, [clone_doc["owner_id"]])
         log.info("Clone started: %s", clone_doc.get("bot_username", bot_id))
         return True
     except Exception as exc:
@@ -62,21 +64,6 @@ async def boot_clone(clone_doc: Dict[str, Any]) -> bool:
 # ═════════════════════════════════════════════════════════════════════
 #  MASTER BOT handlers
 # ═════════════════════════════════════════════════════════════════════
-MASTER_INTRO = (
-    "<b>Nohara Store Bot — Create your own digital store bot</b>\n\n"
-    "1. Create a bot in @BotFather and copy its token\n"
-    "2. Send <code>/clone BOT_TOKEN</code> here\n"
-    "3. Open your new bot and follow the setup steps\n\n"
-    "<code>/clone TOKEN</code> — create your store bot\n"
-    "<code>/myclones</code> — list your bots\n"
-    "<code>/deleteclone BOT_ID</code> — remove a bot"
-)
-
-
-async def master_start(client: Client, message: Message) -> None:
-    await message.reply_text(MASTER_INTRO)
-
-
 async def master_clone(client: Client, message: Message) -> None:
     if not message.from_user:
         return
@@ -127,6 +114,7 @@ async def master_clone(client: Client, message: Message) -> None:
         return
 
     await db.register_clone(bot_id, owner_id, f"@{me.username}", token)
+    await apply_command_menu(clone_client, [owner_id])  # user + admin commands, automatically
     if MASTER_AUDIT_CHANNEL_ID:
         try:
             await client.send_message(
@@ -174,6 +162,9 @@ async def master_deleteclone(client: Client, message: Message) -> None:
     bot_id = args[0].strip()
     clone = await db.get_clone(bot_id)
     user_id = message.from_user.id
+    if clone and clone.get("is_master"):
+        await message.reply_text("❌ The master store cannot be deleted.")
+        return
     if not clone or (clone["owner_id"] != user_id and not _is_admin(user_id)):
         await message.reply_text("❌ Bot not found.")
         return
@@ -194,9 +185,8 @@ async def master_deleteclone(client: Client, message: Message) -> None:
 
 
 def register_master_handlers(client: Client) -> None:
-    client.nohara_bot_id = "master"
+    """Adds the platform commands to the master bot. (Its store features come from register_store_handlers.)"""
     private = filters.private
-    client.add_handler(MessageHandler(master_start, private & filters.command(["start", "help"])))
     client.add_handler(MessageHandler(master_clone, private & filters.command("clone")))
     client.add_handler(MessageHandler(master_myclones, private & filters.command("myclones")))
     client.add_handler(MessageHandler(master_deleteclone, private & filters.command("deleteclone")))
