@@ -5,15 +5,17 @@ NOHARA STORE BOT — Store bot — owner commands (/setdbchannel, /addproduct, /
 
 import html
 import re
+import time
 import uuid
 from hydrogram import Client
 from hydrogram.types import Message
 from typing import Optional
 
+from nohara_bot.buttons import markup
 from nohara_bot.config import APP_URL
 from nohara_bot.database import db
 from nohara_bot.fonts import FONT_MODES
-from nohara_bot.handlers.admin import screen_home
+from nohara_bot.handlers.admin import B as bc_button, BC_PENDING, BC_RUNNING, screen_home
 from nohara_bot.handlers.common import (
     DIVIDER,
     BANNER_FIELDS,
@@ -26,6 +28,7 @@ from nohara_bot.i18n import SUPPORTED_LANG_CODES
 from nohara_bot.services.core import (
     send_ui,
     Ctx,
+    fmt_date,
     fmt_usd,
     parse_usd_to_cents,
     send_audit,
@@ -462,6 +465,4 @@ async def cmd_addmoney(client: Client, message: Message, ctx: Ctx) -> None:
 
 
 @owner_only
-async def cmd_removemoney(client: Client, message: Message, ctx: Ctx) -> None:
-    await _money_command(client, message, ctx, add=False)
-        
+async def cmd_removemoney(client: Client, message: Message, ctx: Ctx) 
