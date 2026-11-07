@@ -38,6 +38,7 @@ class NoharaDatabase:
         self.wallets = self.db["user_wallets"]
         self.orders = self.db["orders_ledger"]
         self.users = self.db["bot_users"]
+        self.coupons = self.db["coupons"]
 
     async def init_indexes(self) -> None:
         await self.clones.create_index("owner_id")
@@ -45,6 +46,7 @@ class NoharaDatabase:
         await self.wallets.create_index([("bot_id", 1), ("user_id", 1)], unique=True)
         await self.orders.create_index([("bot_id", 1), ("user_id", 1), ("created_at", -1)])
         await self.users.create_index([("bot_id", 1), ("user_id", 1)], unique=True)
+        await self.coupons.create_index([("bot_id", 1), ("code", 1)], unique=True)
 
     # ───────────────────────── Clones ─────────────────────────
     async def register_clone(self, bot_id: str, owner_id: int, bot_username: str, token: str) -> Dict[str, Any]:
@@ -58,6 +60,7 @@ class NoharaDatabase:
             "default_language": DEFAULT_LANGUAGE,
             "font_style": DEFAULT_FONT_STYLE,
             "welcome_msg": "",
+            "links": {"updates_url": "", "support_url": ""},
             "ui_branding": {
                 "start_photo_message_id": 0,
                 "catalog_photo_message_id": 0,
@@ -124,6 +127,10 @@ class NoharaDatabase:
     async def update_clone_fields(self, bot_id: str, fields: Dict[str, Any]) -> None:
         await self.clones.update_one({"_id": str(bot_id)}, {"$set": fields})
 
+    async def set_link(self, bot_id: str, which: str, url: str) -> None:
+        """which = 'updates' | 'support'. Empty url removes the button from the main menu."""
+        await self.update_clone_fields(bot_id, {f"links.{which}_url": url})
+
     async def set_channels(self, bot_id: str, db_channel_id: Optional[int] = None, log_channel_id: Optional[int] = None) -> None:
         fields: Dict[str, Any] = {}
         if db_channel_id is not None:
@@ -187,15 +194,75 @@ class NoharaDatabase:
             upsert=True,
         )
 
-    async def touch_user(self, bot_id: str, user_id: int) -> None:
-        await self.users.update_one(
+    async def touch_user(self, bot_id: str, user_id: int) -> bool:
+        """Registers the user. Returns True when this is the FIRST time we see him."""
+        res = await self.users.update_one(
             {"bot_id": str(bot_id), "user_id": int(user_id)},
             {"$setOnInsert": {"joined_at": _now()}},
             upsert=True,
         )
+        return res.upserted_id is not None
 
     async def count_users(self, bot_id: str) -> int:
         return await self.users.count_documents({"bot_id": str(bot_id)})
+
+    async def get_user(self, bot_id: str, user_id: int) -> Optional[Dict[str, Any]]:
+        return await self.users.find_one({"bot_id": str(bot_id), "user_id": int(user_id)})
+
+    async def list_user_ids(self, bot_id: str) -> List[int]:
+        docs = await self.users.find({"bot_id": str(bot_id)}, {"user_id": 1}).to_list(length=None)
+        return [int(d["user_id"]) for d in docs]
+
+    # ── VIP ──
+    async def extend_vip(self, bot_id: str, user_id: int, days: int) -> int:
+        """Adds `days` to the VIP time (stacks on top of any VIP time that is left). Returns the new expiry."""
+        doc = await self.get_user(bot_id, user_id) or {}
+        start = max(_now(), int(doc.get("vip_until") or 0))
+        until = start + int(days) * 86400
+        await self.users.update_one(
+            {"bot_id": str(bot_id), "user_id": int(user_id)},
+            {"$set": {"vip_until": until}},
+            upsert=True,
+        )
+        return until
+
+    # ── Referral ──
+    async def set_referrer(self, bot_id: str, user_id: int, referrer_id: int) -> None:
+        """Only the first referrer counts, and nobody can refer himself."""
+        if int(user_id) == int(referrer_id):
+            return
+        await self.users.update_one(
+            {"bot_id": str(bot_id), "user_id": int(user_id), "referred_by": {"$exists": False}},
+            {"$set": {"referred_by": int(referrer_id)}},
+        )
+
+    async def claim_referral_reward(self, bot_id: str, user_id: int) -> Optional[Dict[str, Any]]:
+        """Atomic: returns the user document ONLY the first time (so a referrer is rewarded once per friend)."""
+        return await self.users.find_one_and_update(
+            {"bot_id": str(bot_id), "user_id": int(user_id), "referred_by": {"$exists": True}, "ref_rewarded": {"$ne": True}},
+            {"$set": {"ref_rewarded": True}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def add_referral_stats(self, bot_id: str, referrer_id: int, cents: int) -> None:
+        await self.users.update_one(
+            {"bot_id": str(bot_id), "user_id": int(referrer_id)},
+            {"$inc": {"ref_paid_count": 1, "ref_earned_cents": int(cents)}},
+        )
+
+    async def count_referrals(self, bot_id: str, user_id: int) -> int:
+        return await self.users.count_documents({"bot_id": str(bot_id), "referred_by": int(user_id)})
+
+    # ── Active coupon of a user ──
+    async def set_user_coupon(self, bot_id: str, user_id: int, code: str, pct: int) -> None:
+        await self.users.update_one(
+            {"bot_id": str(bot_id), "user_id": int(user_id)},
+            {"$set": {"coupon": {"code": code, "pct": int(pct)}}},
+            upsert=True,
+        )
+
+    async def clear_user_coupon(self, bot_id: str, user_id: int) -> None:
+        await self.users.update_one({"bot_id": str(bot_id), "user_id": int(user_id)}, {"$unset": {"coupon": ""}})
 
     # ───────────────────────── Products ─────────────────────────
     async def save_product(self, bot_id: str, product_id: str, title: str, price_cents: int, stock: int, db_channel_msg_id: int, folder: str = "") -> None:
@@ -304,6 +371,9 @@ class NoharaDatabase:
             "status": status,  # pending | paid | delivered | cancelled | failed | refunded
             "created_at": _now(),
         }
+        order["list_price_cents"] = int(product.get("list_price_cents", product["price_cents"]))
+        if product.get("coupon"):
+            order["coupon"] = str(product["coupon"])
         order.update(extra)
         await self.orders.insert_one(order)
         return order
@@ -336,14 +406,24 @@ class NoharaDatabase:
             sort=[("created_at", -1)],
         )
 
-    async def get_stats(self, bot_id: str) -> Dict[str, int]:
-        paid_filter = {"bot_id": str(bot_id), "status": {"$in": ["paid", "delivered", "refunded"]}}
-        return {
-            "products": await self.products.count_documents({"bot_id": str(bot_id)}),
-            "orders": await self.orders.count_documents(paid_filter),
-            "delivered": await self.orders.count_documents({"bot_id": str(bot_id), "status": "delivered"}),
-            "users": await self.count_users(bot_id),
-        }
+    # ───────────────────────── Coupons ─────────────────────────
+    async def add_coupon(self, bot_id: str, code: str, pct: int, max_uses: int = 0, expires_at: int = 0) -> None:
+        """max_uses 0 = unlimited · expires_at 0 = never. Percent discount on ONE purchase per user."""
+        await self.coupons.replace_one(
+            {"bot_id": str(bot_id), "code": code},
+            {"bot_id": str(bot_id), "code": code, "pct": int(pct), "max_uses": int(max_uses),
+             "expires_at": int(expires_at), "used": 0, "used_by": [], "created_at": _now()},
+            upsert=True,
+        )
 
+    async def get_coupon(self, bot_id: str, code: str) -> Optional[Dict[str, Any]]:
+        return await self.coupons.find_one({"bot_id": str(bot_id), "code": code.upper()})
 
-db = NoharaDatabase(MONGO_URI)
+    async def list_coupons(self, bot_id: str) -> List[Dict[str, Any]]:
+        return await self.coupons.find({"bot_id": str(bot_id)}).sort("created_at", -1).to_list(length=50)
+
+    async def delete_coupon(self, bot_id: str, code: str) -> bool:
+        res = await self.coupons.delete_one({"bot_id": str(bot_id), "code": code.upper()})
+        return res.deleted_count > 0
+
+    async def consume_coupon(self, bot_id: str, code: str, user_id:
