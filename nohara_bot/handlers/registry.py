@@ -7,6 +7,10 @@ from hydrogram import Client, filters
 from hydrogram.handlers import CallbackQueryHandler, MessageHandler
 
 from nohara_bot.handlers.owner import (
+    cmd_addfolder,
+    cmd_delfolder,
+    cmd_folders,
+    cmd_setfolder,
     cmd_addfsub,
     cmd_addmoney,
     cmd_addproduct,
@@ -46,7 +50,7 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
     cmd("start", store_start)
     cmd("changelang", store_changelang)
     cmd("help", store_help)
-    cmd("dashboard", cmd_dashboard)
+    cmd(["admin", "dashboard"], cmd_dashboard)
     cmd("setdbchannel", cmd_setdbchannel)
     cmd("setlogchannel", cmd_setlogchannel)
     cmd("setgateway", cmd_setgateway)
@@ -54,11 +58,15 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
     cmd("setfont", cmd_setfont)
     cmd("setlang", cmd_setlang)
     cmd("setwelcome", cmd_setwelcome)
-    cmd(["setbanner", "setimage", "setstartimage", "setcatalogimage", "setwalletimage", "setstockimage"], cmd_setbanner)
-    cmd(["delbanner", "delimage", "delstartimage", "delcatalogimage", "delwalletimage", "delstockimage"], cmd_delbanner)
+    cmd(["setbanner", "setimage", "setstartimage", "setcatalogimage", "setwalletimage", "setstockimage", "setproductimage", "setoxapayimage", "setfampayimage"], cmd_setbanner)
+    cmd(["delbanner", "delimage", "delstartimage", "delcatalogimage", "delwalletimage", "delstockimage", "delproductimage", "deloxapayimage", "delfampayimage"], cmd_delbanner)
     cmd("addproduct", cmd_addproduct)
     cmd("products", cmd_products)
     cmd("delproduct", cmd_delproduct)
+    cmd("addfolder", cmd_addfolder)
+    cmd("folders", cmd_folders)
+    cmd("delfolder", cmd_delfolder)
+    cmd("setfolder", cmd_setfolder)
     cmd("addfsub", cmd_addfsub)
     cmd("removefsub", cmd_removefsub)
     cmd("fsublist", cmd_fsublist)
