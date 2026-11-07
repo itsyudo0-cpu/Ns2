@@ -8,9 +8,11 @@ import logging
 from decimal import Decimal
 from hydrogram import Client
 from hydrogram.types import CallbackQuery, Message
-from typing import Optional
+from typing import Dict, Optional, Set, Tuple
+from urllib.parse import quote
 
 from nohara_bot.buttons import (
+    after_coupon_keyboard,
     folders_keyboard,
     back_keyboard,
     cancel_keyboard,
@@ -18,7 +20,14 @@ from nohara_bot.buttons import (
     payment_link_keyboard,
     product_keyboard,
     products_keyboard,
+    topup_amount_keyboard,
+    topup_cancel_keyboard,
+    topup_methods_keyboard,
+    referral_keyboard,
     upi_review_keyboard,
+    vip_keyboard,
+    vip_locked_keyboard,
+    wallet_keyboard,
 )
 from nohara_bot.config import APP_URL
 from nohara_bot.database import db
@@ -31,21 +40,38 @@ from nohara_bot.handlers.common import (
     show,
     show_home,
 )
-from nohara_bot.handlers.admin import handle_admin_callback, screen_home
+from nohara_bot.handlers.admin import ADMIN_WAIT, handle_admin_callback, handle_link_input, screen_home
 from nohara_bot.i18n import SUPPORTED_LANG_CODES
 from nohara_bot.payments import create_oxapay_invoice
 from nohara_bot.services.core import (
     Ctx,
     cents_to_inr,
+    coupon_is_valid,
+    fmt_date,
     fmt_usd,
     fulfill_paid_order,
     get_ctx,
+    get_user_perks,
+    parse_usd_to_cents,
+    price_for,
+    referral_cfg,
+    send_audit,
     send_ui,
     spawn,
+    topup_bonus_cents,
+    topup_tiers,
+    vip_cfg,
 )
 
 
 log = logging.getLogger("nohara.handlers.store")
+
+MIN_TOPUP_CENTS = 100       # $1
+MAX_TOPUP_CENTS = 100_000   # $1,000
+# (bot_id, user_id) -> gateway: the user chose "Custom amount" and the next text message is the amount
+TOPUP_WAIT: Dict[Tuple[str, int], str] = {}
+# (bot_id, user_id): the user pressed "Redeem Coupon" and the next text message is the code
+COUPON_WAIT: Set[Tuple[str, int]] = set()
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -59,7 +85,13 @@ async def store_start(client: Client, message: Message) -> None:
     ctx = await get_ctx(bot_id, user_id)
     if not ctx:
         return
-    await db.touch_user(bot_id, user_id)
+    is_new = await db.touch_user(bot_id, user_id)
+    if is_new and referral_cfg(ctx.clone)["enabled"]:
+        args = message.command[1:] if getattr(message, "command", None) else []
+        if args and args[0].startswith("ref_") and args[0][4:].isdigit():
+            referrer_id = int(args[0][4:])
+            if referrer_id != user_id and await db.get_user(bot_id, referrer_id):
+                await db.set_referrer(bot_id, user_id, referrer_id)
     if _is_owner(ctx, user_id):
         spawn(ensure_owner_menu(client, bot_id, user_id, ctx.is_master))
     if not await ensure_fsub(client, ctx, message.chat.id, user_id):
@@ -110,6 +142,11 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
     chat_id = msg.chat.id if msg else user_id
     parts = (query.data or "").split(":")
     action = parts[0]
+
+    # any button press cancels a pending "send me the amount / link" step (handlers below can set it again)
+    TOPUP_WAIT.pop((bot_id, user_id), None)
+    ADMIN_WAIT.pop((bot_id, user_id), None)
+    COUPON_WAIT.discard((bot_id, user_id))
 
     try:
         # ── actions that do not need the force-subscribe check ──
@@ -162,6 +199,14 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
             await _show_products(client, ctx, chat_id, msg, parts[1])
             return
 
+        if action == "vip" and parts[1:] == ["buy"]:
+            await _handle_vip_buy(client, query, ctx)
+            return
+
+        if action == "top" and len(parts) >= 3:
+            await _handle_topup(client, query, ctx, parts)
+            return
+
         if action == "prod" and len(parts) == 2:
             await _handle_product(client, query, ctx, parts[1])
             return
@@ -202,7 +247,23 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
         )
         if ctx.clone["gateways"]["fampay"]["enabled"]:
             text += f"\n🇮🇳 ≈ <b>₹{cents_to_inr(balance, ctx.clone['usd_to_inr'])}</b>"
-        await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "wallet", msg)
+        await show(client, ctx, chat_id, text, wallet_keyboard(ctx.T, ctx.font), "wallet", msg)
+
+    elif target == "topup":
+        await query.answer()
+        await _show_topup_methods(client, ctx, chat_id, query.from_user.id, msg)
+
+    elif target == "vip":
+        await query.answer()
+        await _show_vip(client, ctx, chat_id, user_id, msg)
+
+    elif target == "ref":
+        await query.answer()
+        await _show_referral(client, ctx, chat_id, user_id, msg)
+
+    elif target == "coupon":
+        await query.answer()
+        await _prompt_coupon(client, ctx, chat_id, user_id, msg)
 
     elif target == "lang":
         await query.answer()
@@ -224,218 +285,186 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
         await query.answer()
 
 
-async def _show_products(client: Client, ctx: Ctx, chat_id: int, msg, folder_id) -> None:
-    """Folder list (if the store uses folders) -> product list. folder_id: None = top level, '_' = ungrouped."""
-    bot_id = str(ctx.clone["_id"])
-    folders = ctx.clone.get("folders") or []
-    known = {f["id"]: f["name"] for f in folders}
-    everything = await db.list_products(bot_id)
-    title = f"🛍 {ctx.H(ctx.T('collection_title'))}"
-
-    if folder_id is None and folders:
-        counts: dict = {}
-        for p in everything:
-            key = p.get("folder") if p.get("folder") in known else ""
-            counts[key] = counts.get(key, 0) + 1
-        shown = [(f, counts[f["id"]]) for f in folders if counts.get(f["id"])]
-        if shown:
-            text = f"{title}\n{DIVIDER}\n<i>{html.escape(ctx.T('choose_category'))}</i>"
-            await show(client, ctx, chat_id, text, folders_keyboard(shown, counts.get("", 0), ctx.T, ctx.font), "catalog", msg)
-            return
-
-    back = "menu:home"
-    if folder_id is None:
-        items, head = everything, title
-    elif folder_id == "_":
-        items = [p for p in everything if p.get("folder") not in known]
-        head, back = f"📦 {ctx.H(ctx.T('other_products'))}", "menu:products"
+# ═════════════════════════════════════════════════════════════════════
+#  Premium features: VIP · referral · coupon
+# ═════════════════════════════════════════════════════════════════════
+async def _show_vip(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg, note: str = "") -> None:
+    cfg = vip_cfg(ctx.clone)
+    if not cfg["enabled"]:
+        await show(client, ctx, chat_id, f"💎 {ctx.H('VIP')}\n{DIVIDER}\n{html.escape(ctx.TX('feature_off', 'This feature is not available right now.'))}",
+                   back_keyboard(ctx.T, ctx.font), "wallet", msg)
+        return
+    perks = await get_user_perks(ctx.clone, user_id)
+    balance = await db.get_balance(str(ctx.clone["_id"]), user_id)
+    if perks["vip_active"]:
+        status = f"✅ <b>{html.escape(ctx.TX('vip_active', 'Active'))}</b> · {html.escape(ctx.TX('vip_until', 'until'))} <b>{fmt_date(perks['vip_until'])}</b>"
+        buy_label = ctx.TX("vip_extend", "Extend VIP — {price} / {days} days", price=fmt_usd(cfg["price_cents"]), days=cfg["days"])
     else:
-        items = [p for p in everything if p.get("folder") == folder_id]
-        head, back = f"🗂 {ctx.H(known.get(folder_id, 'Folder'))}", "menu:products"
-
-    if not items:
-        text = f"{head}\n{DIVIDER}\n{html.escape(ctx.T('no_products'))}"
-        await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "catalog", msg)
-        return
-    text = f"{head}  <b>·</b>  {len(items)} {html.escape(ctx.T('items_label'))}\n{DIVIDER}\n<i>{html.escape(ctx.T('tap_to_view'))}</i>"
-    await show(client, ctx, chat_id, text, products_keyboard(items, ctx.T, ctx.font, fmt_usd, back), "catalog", msg)
-
-
-async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, product_id: str) -> None:
-    bot_id = client.nohara_bot_id
-    msg = query.message
-    chat_id = msg.chat.id if msg else query.from_user.id
-    product = await db.get_product(bot_id, product_id)
-    if not product:
-        await query.answer(ctx.T("something_wrong"), show_alert=True)
-        return
-    await query.answer()
-
-    gateways = ctx.clone["gateways"]
-    oxapay_on = bool(gateways["oxapay"]["enabled"] and APP_URL)
-    fampay_on = bool(gateways["fampay"]["enabled"] and gateways["fampay"]["upi_id"])
-    in_stock = product["stock"] != 0
-
-    price = f"<b>{fmt_usd(product['price_cents'])}</b>"
-    if fampay_on:
-        price += f"  (≈ ₹{cents_to_inr(product['price_cents'], ctx.clone['usd_to_inr'])})"
-    stock_text = (
-        ctx.T("unlimited_label") if product["stock"] == -1 else f"{product['stock']} {ctx.T('left_label')}"
-    )
+        status = f"❌ {html.escape(ctx.TX('vip_inactive', 'Not a member yet'))}"
+        buy_label = ctx.TX("vip_join", "Join VIP — {price} / {days} days", price=fmt_usd(cfg["price_cents"]), days=cfg["days"])
     text = (
-        f"💎 {ctx.H(product['title'])}\n{DIVIDER}\n"
-        f"💵 {html.escape(ctx.T('price_label'))}: {price}\n"
-        f"📦 {html.escape(ctx.T('stock_label'))}: <b>{html.escape(stock_text)}</b>\n"
-        f"⚡ {html.escape(ctx.T('instant_delivery_line'))}"
+        f"💎 {ctx.H(ctx.TX('vip_title', 'VIP Membership'))}\n{DIVIDER}\n"
+        f"{html.escape(ctx.TX('vip_status', 'Status'))}: {status}\n\n"
+        f"<b>{html.escape(ctx.TX('vip_benefits', 'Benefits'))}</b>\n"
+        f"• 🏷 {html.escape(ctx.TX('vip_b1', '{pct}% off every product', pct=cfg['discount_pct']))}\n"
+        f"• 🔓 {html.escape(ctx.TX('vip_b2', 'Access to VIP-only products'))}\n"
+        f"• ⚡ {html.escape(ctx.TX('vip_b3', 'Instant delivery, always'))}\n\n"
+        f"💵 {html.escape(ctx.TX('vip_price', 'Price'))}: <b>{fmt_usd(cfg['price_cents'])}</b> / {cfg['days']} {html.escape(ctx.TX('days', 'days'))}\n"
+        f"👛 {html.escape(ctx.T('balance_label'))}: <b>{fmt_usd(balance)}</b>"
     )
-    if not in_stock:
-        text += f"\n\n{html.escape(ctx.T('out_of_stock_msg'))}"
-
-    known = {f["id"] for f in ctx.clone.get("folders") or []}
-    if known:
-        back_cb = f"fold:{product['folder']}" if product.get("folder") in known else "fold:_"
-    else:
-        back_cb = "menu:products"
-    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, back_cb)
-    await show(client, ctx, chat_id, text, kb, "product" if in_stock else "stock", msg)
+    if note:
+        text = f"{note}\n\n{text}"
+    await show(client, ctx, chat_id, text, vip_keyboard(ctx.T, ctx.font, buy_label), "wallet", msg)
 
 
-async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: str, product_id: str) -> None:
+async def _handle_vip_buy(client: Client, query: CallbackQuery, ctx: Ctx) -> None:
     bot_id = client.nohara_bot_id
     user_id = query.from_user.id
     msg = query.message
     chat_id = msg.chat.id if msg else user_id
-
-    product = await db.get_product(bot_id, product_id)
-    if not product:
-        await query.answer(ctx.T("something_wrong"), show_alert=True)
+    cfg = vip_cfg(ctx.clone)
+    if not cfg["enabled"]:
+        await query.answer(ctx.TX("feature_off", "This feature is not available right now."), show_alert=True)
         return
-    if product["stock"] == 0:
-        await query.answer(ctx.T("out_of_stock_msg"), show_alert=True)
+    if not await db.debit(bot_id, user_id, int(cfg["price_cents"])):
+        await query.answer(ctx.T("insufficient_balance"), show_alert=True)
         return
-
-    gateways = ctx.clone["gateways"]
-
-    # ───────────── Wallet ─────────────
-    if method == "wallet":
-        # 1) take one unit of stock (atomic)  2) take the money (atomic)  3) deliver
-        if not await db.reserve_stock(bot_id, product_id):
-            await query.answer(ctx.T("out_of_stock_msg"), show_alert=True)
-            return
-        if not await db.debit(bot_id, user_id, product["price_cents"]):
-            await db.release_stock(bot_id, product_id)
-            await query.answer(ctx.T("insufficient_balance"), show_alert=True)
-            return
-        order = await db.create_order(bot_id, user_id, product, method="wallet", status="paid")
-        await query.answer()
-        try:
-            if msg:
-                await msg.delete()
-        except Exception:
-            pass
-        await fulfill_paid_order(order, stock_reserved=True)
-        return
-
-    # ───────────── OxaPay (crypto) ─────────────
-    if method == "oxapay":
-        api_key = db.get_oxapay_key(ctx.clone)
-        if not (gateways["oxapay"]["enabled"] and api_key and APP_URL):
-            await query.answer(ctx.T("gateway_error"), show_alert=True)
-            return
-        await query.answer()
-        order = await db.create_order(bot_id, user_id, product, method="oxapay", status="pending")
-        invoice = await create_oxapay_invoice(
-            merchant_api_key=api_key,
-            amount_usd=Decimal(product["price_cents"]) / 100,
-            order_id=order["_id"],
-            callback_url=f"{APP_URL}/webhook/oxapay/{bot_id}",
-            description=product["title"],
-        )
-        if not invoice:
-            await db.set_order_fields(order["_id"], status="failed")
-            await client.send_message(chat_id, ctx.T("gateway_error"))
-            return
-        await db.set_order_fields(order["_id"], track_id=str(invoice["track_id"]))
-        text = f"{ctx.H(product['title'])}\n💵 <b>{fmt_usd(product['price_cents'])}</b>\n\n{html.escape(ctx.T('pay_link_msg'))}"
-        kb = payment_link_keyboard(invoice["payment_url"], order["_id"], ctx.T, ctx.font)
-        await show(client, ctx, chat_id, text, kb, banner="oxapay", replace=msg)
-        return
-
-    # ───────────── UPI / FamPay (manual verification by the owner) ─────────────
-    if method == "fampay":
-        upi_id = gateways["fampay"]["upi_id"]
-        if not (gateways["fampay"]["enabled"] and upi_id):
-            await query.answer(ctx.T("gateway_error"), show_alert=True)
-            return
-        await query.answer()
-        amount_inr = cents_to_inr(product["price_cents"], ctx.clone["usd_to_inr"])
-        order = await db.create_order(bot_id, user_id, product, method="upi", status="pending", amount_inr=str(amount_inr))
-        text = ctx.T("upi_instructions", amount=amount_inr, upi=html.escape(upi_id), order_id=order["_id"])
-        await show(client, ctx, chat_id, text, cancel_keyboard(order["_id"], ctx.T, ctx.font), banner="fampay", replace=msg)
-        return
-
-    await query.answer()
-
-
-async def _handle_upi_review(client: Client, query: CallbackQuery, ctx: Ctx, decision: str, order_id: str) -> None:
-    """Owner presses Approve / Reject under a payment proof."""
-    bot_id = client.nohara_bot_id
-    if not _is_owner(ctx, query.from_user.id):
-        await query.answer(ctx.T("owner_only"), show_alert=True)
-        return
-    order = await db.get_order(order_id)
-    if not order or order["bot_id"] != bot_id or order["method"] != "upi":
-        await query.answer("Order not found.", show_alert=True)
-        return
-
-    if decision == "ok":
-        paid = await db.mark_paid(order_id)  # atomic -> a double click can never deliver twice
-        if not paid:
-            await query.answer("Already processed.", show_alert=True)
-            return
-        await query.answer("Approved ✅")
-        await _append_to_message(query.message, "✅ <b>Approved</b>")
-        spawn(fulfill_paid_order(paid, stock_reserved=False))
-    else:
-        if not await db.cancel_order(order_id):
-            await query.answer("Already processed.", show_alert=True)
-            return
-        await query.answer("Rejected")
-        await _append_to_message(query.message, "❌ <b>Rejected</b>")
-        buyer_ctx = await get_ctx(bot_id, order["user_id"])
-        if buyer_ctx:
-            try:
-                await client.send_message(order["user_id"], buyer_ctx.T("upi_rejected"))
-            except Exception:
-                pass
-
-
-async def store_user_message(client: Client, message: Message) -> None:
-    """A buyer sends a UTR / screenshot after choosing UPI payment -> forward to the owner for review."""
-    if not message.from_user:
-        return
-    bot_id = client.nohara_bot_id
-    user_id = message.from_user.id
-    order = await db.get_open_upi_order(bot_id, user_id)
-    if not order:
-        return
-    ctx = await get_ctx(bot_id, user_id)
-    if not ctx:
-        return
-
-    summary = (
-        f"💸 <b>UPI payment proof</b>\n"
-        f"• Order: <code>{order['_id']}</code>\n"
-        f"• Buyer: <code>{user_id}</code> {html.escape(message.from_user.first_name or '')}\n"
-        f"• Product: <b>{html.escape(order['title'])}</b>\n"
-        f"• Amount: <b>₹{order.get('amount_inr', '?')}</b> ({fmt_usd(order['price_cents'])})"
+    until = await db.extend_vip(bot_id, user_id, int(cfg["days"]))
+    await query.answer("💎 VIP activated!")
+    await send_audit(
+        ctx.clone,
+        f"<b>[NOHARA AUDIT — VIP PURCHASE]</b>\n• User: <code>{user_id}</code> | Paid: <b>{fmt_usd(cfg['price_cents'])}</b> (wallet) | Until: {fmt_date(until)}",
     )
-    try:
-        await message.forward(ctx.owner_id)
-        await send_ui(client, ctx.owner_id, summary, upi_review_keyboard(order["_id"]))
-    except Exception:
-        log.exception("Could not forward UPI proof to owner")
-        await message.reply_text(ctx.T("something_wrong"))
+    await _show_vip(client, ctx, chat_id, user_id, msg, note="🎉 <b>VIP activated — enjoy your benefits!</b>")
+
+
+async def _show_referral(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg) -> None:
+    cfg = referral_cfg(ctx.clone)
+    if not cfg["enabled"]:
+        await show(client, ctx, chat_id, f"🎁 {ctx.H('Refer & Earn')}\n{DIVIDER}\n{html.escape(ctx.TX('feature_off', 'This feature is not available right now.'))}",
+                   back_keyboard(ctx.T, ctx.font), "wallet", msg)
         return
-    await message.reply_text(ctx.T("upi_proof_received"))
-    
+    bot_id = str(ctx.clone["_id"])
+    username = str(ctx.clone.get("bot_username", "")).lstrip("@")
+    link = f"https://t.me/{username}?start=ref_{user_id}"
+    invited = await db.count_referrals(bot_id, user_id)
+    user = await db.get_user(bot_id, user_id) or {}
+    earned = int(user.get("ref_earned_cents") or 0)
+    text = (
+        f"🎁 {ctx.H(ctx.TX('ref_title', 'Refer & Earn'))}\n{DIVIDER}\n"
+        f"{html.escape(ctx.TX('ref_desc', 'Share your personal link. When a friend makes their first payment, you earn {amount} in your wallet — unlimited!', amount=fmt_usd(int(cfg['bonus_cents']))))}\n\n"
+        f"🔗 <b>{html.escape(ctx.TX('ref_your_link', 'Your link'))}</b>\n<code>{html.escape(link)}</code>\n\n"
+        f"👥 {html.escape(ctx.TX('ref_joined', 'Friends joined'))}: <b>{invited}</b>\n"
+        f"💰 {html.escape(ctx.TX('ref_earned', 'Total earned'))}: <b>{fmt_usd(earned)}</b>"
+    )
+    share_text = ctx.TX("ref_share_text", "Join this store and get premium digital products instantly!")
+    share_url = f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(share_text, safe='')}"
+    await show(client, ctx, chat_id, text, referral_keyboard(ctx.T, ctx.font, share_url), "wallet", msg)
+
+
+async def _prompt_coupon(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg) -> None:
+    perks = await get_user_perks(ctx.clone, user_id)
+    active = (perks["user"] or {}).get("coupon")
+    text = (
+        f"🎟 {ctx.H(ctx.TX('coupon_title', 'Redeem Coupon'))}\n{DIVIDER}\n"
+        f"{html.escape(ctx.TX('coupon_send', 'Send your coupon code as a message.'))}"
+    )
+    if active:
+        text += f"\n\n✅ {html.escape(ctx.TX('coupon_active', 'Active coupon'))}: <code>{html.escape(active['code'])}</code> (−{active['pct']}%)"
+    COUPON_WAIT.add((str(ctx.clone["_id"]), user_id))
+    await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "wallet", msg)
+
+
+async def _handle_coupon_input(client: Client, message: Message, ctx: Ctx) -> None:
+    bot_id = str(ctx.clone["_id"])
+    user_id = message.from_user.id
+    code = (message.text or "").strip().upper()
+    coupon = await db.get_coupon(bot_id, code) if code and len(code) <= 32 else None
+    if not coupon_is_valid(coupon, user_id):
+        await message.reply_text("❌ " + html.escape(ctx.TX("coupon_invalid", "Invalid, expired or already used coupon. Send another code, or press Home.")))
+        return
+    COUPON_WAIT.discard((bot_id, user_id))
+    await db.set_user_coupon(bot_id, user_id, coupon["code"], int(coupon["pct"]))
+    await send_ui(
+        client, message.chat.id,
+        f"✅ <b>{html.escape(ctx.TX('coupon_applied', 'Coupon applied!'))}</b>\n"
+        f"🎟 <code>{html.escape(coupon['code'])}</code> — <b>{coupon['pct']}% OFF</b>\n"
+        f"{html.escape(ctx.TX('coupon_note', 'It is applied automatically to your next purchase (one use).'))}",
+        after_coupon_keyboard(ctx.T, ctx.font),
+    )
+
+
+async def _vip_gate(client: Client, ctx: Ctx, chat_id: int, user_id: int, product: dict, msg, back_cb: str) -> bool:
+    """True when the product is VIP-only and this user may not open it (the lock screen is shown)."""
+    if not product.get("vip_only") or _is_owner(ctx, user_id):
+        return False
+    perks = await get_user_perks(ctx.clone, user_id)
+    if perks["vip_active"]:
+        return False
+    text = (
+        f"🔒 {ctx.H(product['title'])}\n{DIVIDER}\n"
+        f"💎 {html.escape(ctx.TX('vip_only_msg', 'This is a VIP-only product. Join VIP to unlock it and save on everything else too.'))}"
+    )
+    await show(client, ctx, chat_id, text, vip_locked_keyboard(ctx.T, ctx.font, back_cb), "product", msg)
+    return True
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Wallet top-up
+# ═════════════════════════════════════════════════════════════════════
+def _gateway_flags(ctx: Ctx) -> Tuple[bool, bool]:
+    """(crypto live, UPI live) — the same switches the owner controls in Admin Panel -> Payments."""
+    gw = ctx.clone["gateways"]
+    oxapay_on = bool(gw["oxapay"]["enabled"] and APP_URL and db.get_oxapay_key(ctx.clone))
+    fampay_on = bool(gw["fampay"]["enabled"] and gw["fampay"]["upi_id"])
+    return oxapay_on, fampay_on
+
+
+async def _show_topup_methods(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg) -> None:
+    oxapay_on, fampay_on = _gateway_flags(ctx)
+    title = f"💰 {ctx.H(ctx.TX('topup_title', 'Top Up Wallet'))}"
+    if not (oxapay_on or fampay_on):
+        text = f"{title}\n{DIVIDER}\n" + html.escape(
+            ctx.TX("topup_unavailable", "Top-up is not available right now. Please contact the store owner.")
+        )
+        await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "wallet", msg)
+        return
+    balance = await db.get_balance(str(ctx.clone["_id"]), user_id)
+    text = (
+        f"{title}\n{DIVIDER}\n"
+        f"💰 {html.escape(ctx.T('balance_label'))}:  <b>{fmt_usd(balance)}</b>\n\n"
+        f"{html.escape(ctx.TX('topup_choose_method', 'Choose a payment method:'))}"
+    )
+    await show(client, ctx, chat_id, text, topup_methods_keyboard(ctx.T, ctx.font, oxapay_on, fampay_on), "wallet", msg)
+
+
+async def _show_topup_amounts(client: Client, ctx: Ctx, chat_id: int, method: str, msg) -> None:
+    name = "🪙 Crypto (OxaPay)" if method == "oxapay" else "🇮🇳 UPI"
+    text = (
+        f"💰 {ctx.H(ctx.TX('topup_title', 'Top Up Wallet'))}\n{DIVIDER}\n"
+        f"{name}\n\n"
+        f"{html.escape(ctx.TX('topup_choose_amount', 'Choose an amount (USD):'))}\n"
+        f"<i>Min {fmt_usd(MIN_TOPUP_CENTS)} · Max {fmt_usd(MAX_TOPUP_CENTS)}</i>"
+    )
+    if method == "fampay":
+        text += f"\n<i>1 USD = ₹{ctx.clone['usd_to_inr']}</i>"
+    tiers = topup_tiers(ctx.clone)
+    if tiers:
+        text += "\n\n🎁 <b>" + html.escape(ctx.TX("bonus_title", "Top-up bonus")) + "</b>\n" + "\n".join(
+            f"• {fmt_usd(int(t['min_cents']))}+ → <b>+{int(t['pct'])}%</b>" for t in tiers
+        )
+    await show(client, ctx, chat_id, text, topup_amount_keyboard(method, ctx.T, ctx.font), "wallet", msg)
+
+
+async def _handle_topup(client: Client, query: CallbackQuery, ctx: Ctx, parts: list) -> None:
+    """Callbacks: top:m:<gw> (pick method) · top:a:<gw>:<cents> (pick amount) · top:c:<gw> (custom amount)."""
+    bot_id = client.nohara_bot_id
+    user_id = query.from_user.id
+    msg = query.message
+    chat_id = msg.chat.id if msg else user_id
+    sub, method = parts[1], parts[2]
+
+    oxapay_on, fampay_on = _gateway_flags(ctx)
+    live = {"oxapay": oxapay_on, "fampay": fampay_on}
+    if not live.get(method):
+       
