@@ -63,6 +63,9 @@ class NoharaDatabase:
                 "catalog_photo_message_id": 0,
                 "wallet_photo_message_id": 0,
                 "out_of_stock_photo_message_id": 0,
+                "product_photo_message_id": 0,
+                "oxapay_photo_message_id": 0,
+                "fampay_photo_message_id": 0,
             },
             "gateways": {
                 "oxapay": {"enabled": False, "api_key_encrypted": ""},
@@ -70,6 +73,7 @@ class NoharaDatabase:
             },
             "usd_to_inr": float(DEFAULT_USD_TO_INR),
             "fsub_channels": [],
+            "folders": [],
             "custom_translations": {},
             "created_at": _now(),
         }
@@ -194,7 +198,7 @@ class NoharaDatabase:
         return await self.users.count_documents({"bot_id": str(bot_id)})
 
     # ───────────────────────── Products ─────────────────────────
-    async def save_product(self, bot_id: str, product_id: str, title: str, price_cents: int, stock: int, db_channel_msg_id: int) -> None:
+    async def save_product(self, bot_id: str, product_id: str, title: str, price_cents: int, stock: int, db_channel_msg_id: int, folder: str = "") -> None:
         """Stores ONLY metadata + the message_id pointer inside the owner's private DB channel."""
         doc = {
             "_id": product_id,
@@ -203,12 +207,31 @@ class NoharaDatabase:
             "price_cents": int(price_cents),
             "stock": int(stock),  # -1 = unlimited
             "db_channel_message_id": int(db_channel_msg_id),
+            "folder": folder,
             "created_at": _now(),
         }
         await self.products.replace_one({"_id": product_id}, doc, upsert=True)
 
     async def list_products(self, bot_id: str) -> List[Dict[str, Any]]:
         return await self.products.find({"bot_id": str(bot_id)}).sort("created_at", 1).to_list(length=200)
+
+    async def add_folder(self, bot_id: str, name: str) -> str:
+        folder_id = uuid.uuid4().hex[:6]
+        await self.clones.update_one({"_id": str(bot_id)}, {"$push": {"folders": {"id": folder_id, "name": name}}})
+        return folder_id
+
+    async def delete_folder(self, bot_id: str, folder_id: str) -> bool:
+        """Removes the folder; its products are kept and move to 'Other products'."""
+        res = await self.clones.update_one({"_id": str(bot_id)}, {"$pull": {"folders": {"id": folder_id}}})
+        await self.products.update_many({"bot_id": str(bot_id), "folder": folder_id}, {"$set": {"folder": ""}})
+        return res.modified_count > 0
+
+    async def set_product_folder(self, bot_id: str, product_id: str, folder_id: str) -> bool:
+        res = await self.products.update_one({"_id": product_id, "bot_id": str(bot_id)}, {"$set": {"folder": folder_id}})
+        return res.matched_count > 0
+
+    async def list_all_clones(self, limit: int = 15) -> List[Dict[str, Any]]:
+        return await self.clones.find({"is_master": {"$ne": True}}).sort("created_at", -1).to_list(length=limit)
 
     async def get_product(self, bot_id: str, product_id: str) -> Optional[Dict[str, Any]]:
         return await self.products.find_one({"_id": product_id, "bot_id": str(bot_id)})
