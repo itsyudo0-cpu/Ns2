@@ -465,4 +465,174 @@ async def cmd_addmoney(client: Client, message: Message, ctx: Ctx) -> None:
 
 
 @owner_only
-async def cmd_removemoney(client: Client, message: Message, ctx: Ctx) 
+async def cmd_removemoney(client: Client, message: Message, ctx: Ctx) -> None:
+    await _money_command(client, message, ctx, add=False)
+
+
+# ═════════════════════════ VIP · referral · bonus · coupons · broadcast ═════════════════════════
+@owner_only
+async def cmd_broadcast(client: Client, message: Message, ctx: Ctx) -> None:
+    """/broadcast text   — or reply to ANY message (photo, video, formatted post…) with /broadcast. Free for everyone."""
+    bot_id = client.nohara_bot_id
+    chat_id = message.chat.id
+    replied = message.reply_to_message
+    text = _rest_of_text(message)
+    if replied:
+        source = {"kind": "copy", "chat_id": chat_id, "message_id": replied.id}
+    elif text:
+        source = {"kind": "text", "text": text}
+    else:
+        await message.reply_text(
+            "<b>Usage:</b>\n<code>/broadcast Your message</code>\nor reply to any message (photo, video, post) with <code>/broadcast</code>"
+        )
+        return
+    if bot_id in BC_RUNNING:
+        await message.reply_text("⏳ A broadcast is already running. Wait for its report first.")
+        return
+    try:  # the preview is a real send to the owner, so a broken message is caught BEFORE it goes to everybody
+        if source["kind"] == "copy":
+            await client.copy_message(chat_id, chat_id, replied.id)
+        else:
+            await client.send_message(chat_id, text)
+    except Exception as exc:
+        await message.reply_text(f"❌ This message cannot be sent (check the formatting).\n<code>{html.escape(str(exc))}</code>")
+        return
+    BC_PENDING[(bot_id, message.from_user.id)] = source
+    total = await db.count_users(bot_id)
+    kb = markup([[bc_button("✅ Send to all", "adm:bcgo", "primary"), bc_button("✖️ Cancel", "adm:bccancel", "danger")]])
+    await send_ui(client, chat_id, f"📣 <b>Preview above.</b>\nSend it to <b>{total}</b> users?", kb)
+
+
+@owner_only
+async def cmd_setvip(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    bot_id = client.nohara_bot_id
+    if len(args) == 1 and args[0].lower() in ("on", "off"):
+        await db.update_clone_fields(bot_id, {"vip.enabled": args[0].lower() == "on"})
+        await message.reply_text(f"✅ VIP membership is now <b>{args[0].upper()}</b>.")
+        return
+    price = parse_usd_to_cents(args[0]) if len(args) == 3 else None
+    ok_days = len(args) == 3 and args[1].isdigit() and 1 <= int(args[1]) <= 3650
+    ok_pct = len(args) == 3 and args[2].isdigit() and 1 <= int(args[2]) <= 90
+    if not (price and ok_days and ok_pct):
+        await message.reply_text(
+            "<b>Usage:</b> <code>/setvip PRICE_USD DAYS DISCOUNT_PERCENT</code>\nExample: <code>/setvip 5 30 15</code> → $5 for 30 days, 15% off everything.\n"
+            "Switch on/off: <code>/setvip on</code> · <code>/setvip off</code>"
+        )
+        return
+    await db.update_clone_fields(bot_id, {"vip.price_cents": price, "vip.days": int(args[1]), "vip.discount_pct": int(args[2]), "vip.enabled": True})
+    await message.reply_text(f"✅ <b>VIP saved:</b> {fmt_usd(price)} for {args[1]} days · {args[2]}% off every product.")
+
+
+@owner_only
+async def cmd_setreferral(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    bot_id = client.nohara_bot_id
+    if len(args) == 1 and args[0].lower() in ("on", "off"):
+        await db.update_clone_fields(bot_id, {"referral.enabled": args[0].lower() == "on"})
+        await message.reply_text(f"✅ Referral is now <b>{args[0].upper()}</b>.")
+        return
+    bonus = 0 if args[:1] == ["0"] else (parse_usd_to_cents(args[0]) if len(args) == 1 else None)
+    if bonus is None or bonus > 10000:
+        await message.reply_text(
+            "<b>Usage:</b> <code>/setreferral BONUS_USD</code> — what the inviter earns when a friend makes a first payment.\n"
+            "Example: <code>/setreferral 0.5</code> · <code>/setreferral off</code>"
+        )
+        return
+    await db.update_clone_fields(bot_id, {"referral.bonus_cents": bonus, "referral.enabled": True})
+    await message.reply_text(f"✅ <b>Referral bonus saved:</b> {fmt_usd(bonus)} per invited friend (paid on the friend's first payment of $1 or more).")
+
+
+@owner_only
+async def cmd_settopupbonus(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    bot_id = client.nohara_bot_id
+    if len(args) == 1 and args[0].lower() == "off":
+        await db.update_clone_fields(bot_id, {"topup_bonus": []})
+        await message.reply_text("✅ Top-up bonus is now <b>OFF</b>.")
+        return
+    if len(args) == 1 and args[0].lower() == "default":
+        await db.update_clone_fields(bot_id, {"topup_bonus": None})
+        await message.reply_text("✅ Top-up bonus reset to the default tiers.")
+        return
+    tiers = []
+    for token in args:
+        m = re.fullmatch(r"([\d.]+):(\d{1,2})", token)
+        cents = parse_usd_to_cents(m.group(1)) if m else None
+        if not (m and cents and 1 <= int(m.group(2)) <= 50):
+            tiers = []
+            break
+        tiers.append({"min_cents": cents, "pct": int(m.group(2))})
+    if not tiers or len(tiers) > 6:
+        await message.reply_text(
+            "<b>Usage:</b> <code>/settopupbonus 10:5 25:10 50:15</code>\n(top up $10+ → +5%, $25+ → +10%, $50+ → +15%)\n"
+            "<code>/settopupbonus off</code> · <code>/settopupbonus default</code>"
+        )
+        return
+    await db.update_clone_fields(bot_id, {"topup_bonus": tiers})
+    lines = "\n".join(f"• {fmt_usd(t['min_cents'])}+ → +{t['pct']}%" for t in sorted(tiers, key=lambda t: t["min_cents"]))
+    await message.reply_text(f"✅ <b>Top-up bonus saved:</b>\n{lines}")
+
+
+@owner_only
+async def cmd_addcoupon(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    code = args[0].upper() if args else ""
+    ok_code = bool(re.fullmatch(r"[A-Z0-9_-]{3,20}", code))
+    pct_ok = len(args) >= 2 and args[1].isdigit() and 1 <= int(args[1]) <= 90
+    uses_ok = len(args) < 3 or args[2].isdigit()
+    days_ok = len(args) < 4 or (args[3].isdigit() and 1 <= int(args[3]) <= 3650)
+    if not (ok_code and pct_ok and uses_ok and days_ok) or len(args) > 4:
+        await message.reply_text(
+            "<b>Usage:</b> <code>/addcoupon CODE PERCENT [MAX_USES] [DAYS]</code>\n"
+            "Example: <code>/addcoupon WELCOME20 20 100 30</code> → 20% off, first 100 users, valid 30 days.\n"
+            "<code>/addcoupon DIWALI15 15</code> → unlimited uses, never expires. (MAX_USES <code>0</code> = unlimited.)"
+        )
+        return
+    max_uses = int(args[2]) if len(args) >= 3 else 0
+    expires = int(time.time()) + int(args[3]) * 86400 if len(args) == 4 else 0
+    await db.add_coupon(client.nohara_bot_id, code, int(args[1]), max_uses, expires)
+    await message.reply_text(
+        f"✅ <b>Coupon created:</b> <code>{code}</code> — {args[1]}% off\n"
+        f"Uses: {max_uses or 'unlimited'} · Expires: {fmt_date(expires) if expires else 'never'}\n"
+        f"Users redeem it from the main menu → 🎟 Redeem Coupon."
+    )
+
+
+@owner_only
+async def cmd_delcoupon(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    if not args:
+        await message.reply_text("<b>Usage:</b> <code>/delcoupon CODE</code>")
+        return
+    done = await db.delete_coupon(client.nohara_bot_id, args[0])
+    await message.reply_text("✅ Coupon deleted." if done else "❌ Coupon not found.")
+
+
+@owner_only
+async def cmd_coupons(client: Client, message: Message, ctx: Ctx) -> None:
+    coupons = await db.list_coupons(client.nohara_bot_id)
+    if not coupons:
+        await message.reply_text("No coupons yet. Create one: <code>/addcoupon CODE PERCENT [MAX_USES] [DAYS]</code>")
+        return
+    lines = []
+    for c in coupons:
+        exp = fmt_date(c["expires_at"]) if c.get("expires_at") else "never"
+        limit = c["max_uses"] if c.get("max_uses") else "∞"
+        lines.append(f"🎟 <code>{html.escape(c['code'])}</code> — {c['pct']}% · used {c.get('used', 0)}/{limit} · expires {exp}")
+    await message.reply_text("<b>Your coupons</b>\n" + "\n".join(lines))
+
+
+@owner_only
+async def cmd_vipproduct(client: Client, message: Message, ctx: Ctx) -> None:
+    args = _args(message)
+    if len(args) != 2 or args[1].lower() not in ("on", "off"):
+        await message.reply_text(
+            "<b>Usage:</b> <code>/vipproduct PRODUCT_ID on</code> (VIP-only) · <code>/vipproduct PRODUCT_ID off</code>\nFind IDs with /products."
+        )
+        return
+    done = await db.set_product_vip(client.nohara_bot_id, args[0], args[1].lower() == "on")
+    if not done:
+        await message.reply_text("❌ Product not found. Check the ID with /products.")
+        return
+    await message.reply_text("💎 Product is now <b>VIP-only</b>." if args[1].lower() == "on" else "✅ Product is now available to everyone.")

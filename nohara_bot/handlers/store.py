@@ -467,4 +467,350 @@ async def _handle_topup(client: Client, query: CallbackQuery, ctx: Ctx, parts: l
     oxapay_on, fampay_on = _gateway_flags(ctx)
     live = {"oxapay": oxapay_on, "fampay": fampay_on}
     if not live.get(method):
-       
+        await query.answer(ctx.T("gateway_error"), show_alert=True)
+        return
+
+    if sub == "m":
+        await query.answer()
+        await _show_topup_amounts(client, ctx, chat_id, method, msg)
+    elif sub == "c":
+        await query.answer()
+        TOPUP_WAIT[(bot_id, user_id)] = method
+        text = (
+            f"✍️ {ctx.H(ctx.TX('btn_custom_amount', 'Custom amount'))}\n{DIVIDER}\n"
+            f"{html.escape(ctx.TX('topup_send_amount', 'Send the amount in USD as a message, for example:'))} <code>12.5</code>\n"
+            f"<i>Min {fmt_usd(MIN_TOPUP_CENTS)} · Max {fmt_usd(MAX_TOPUP_CENTS)}</i>"
+        )
+        await show(client, ctx, chat_id, text, topup_cancel_keyboard(ctx.T, ctx.font), "wallet", msg)
+    elif sub == "a" and len(parts) == 4 and parts[3].isdigit():
+        cents = int(parts[3])
+        if not MIN_TOPUP_CENTS <= cents <= MAX_TOPUP_CENTS:
+            await query.answer(ctx.T("something_wrong"), show_alert=True)
+            return
+        await query.answer()
+        await _create_topup(client, ctx, chat_id, user_id, method, cents, msg)
+    else:
+        await query.answer()
+
+
+async def _create_topup(client: Client, ctx: Ctx, chat_id: int, user_id: int, method: str, cents: int, replace) -> None:
+    """Creates a pending top-up order and shows the payment information. The wallet is credited by
+    fulfill_paid_order() once OxaPay confirms the payment / the owner approves the UPI proof."""
+    bot_id = str(ctx.clone["_id"])
+    gateways = ctx.clone["gateways"]
+    pseudo_product = {"_id": "topup", "title": "Wallet top-up", "price_cents": cents}
+
+    if method == "oxapay":
+        api_key = db.get_oxapay_key(ctx.clone)
+        if not (gateways["oxapay"]["enabled"] and api_key and APP_URL):
+            await client.send_message(chat_id, ctx.T("gateway_error"))
+            return
+        order = await db.create_order(bot_id, user_id, pseudo_product, method="oxapay", status="pending", kind="topup")
+        invoice = await create_oxapay_invoice(
+            merchant_api_key=api_key,
+            amount_usd=Decimal(cents) / 100,
+            order_id=order["_id"],
+            callback_url=f"{APP_URL}/webhook/oxapay/{bot_id}",
+            description="Wallet top-up",
+        )
+        if not invoice:
+            await db.set_order_fields(order["_id"], status="failed")
+            await client.send_message(chat_id, ctx.T("gateway_error"))
+            return
+        await db.set_order_fields(order["_id"], track_id=str(invoice["track_id"]))
+        text = (
+            f"💰 {ctx.H(ctx.TX('topup_title', 'Top Up Wallet'))}\n💵 <b>{fmt_usd(cents)}</b>{_bonus_note(ctx, cents)}\n\n"
+            f"{html.escape(ctx.TX('topup_pay_link_msg', 'Tap the button below to pay. Your wallet is credited automatically once the payment is confirmed.'))}"
+        )
+        kb = payment_link_keyboard(invoice["payment_url"], order["_id"], ctx.T, ctx.font)
+        await show(client, ctx, chat_id, text, kb, banner="oxapay", replace=replace)
+        return
+
+    if method == "fampay":
+        upi_id = gateways["fampay"]["upi_id"]
+        if not (gateways["fampay"]["enabled"] and upi_id):
+            await client.send_message(chat_id, ctx.T("gateway_error"))
+            return
+        amount_inr = cents_to_inr(cents, ctx.clone["usd_to_inr"])
+        order = await db.create_order(bot_id, user_id, pseudo_product, method="upi", status="pending", amount_inr=str(amount_inr), kind="topup")
+        text = (
+            f"💰 {ctx.H(ctx.TX('topup_title', 'Top Up Wallet'))}  ·  <b>{fmt_usd(cents)}</b>{_bonus_note(ctx, cents)}\n\n"
+            + ctx.T("upi_instructions", amount=amount_inr, upi=html.escape(upi_id), order_id=order["_id"])
+        )
+        await show(client, ctx, chat_id, text, cancel_keyboard(order["_id"], ctx.T, ctx.font), banner="fampay", replace=replace)
+
+
+def _bonus_note(ctx: Ctx, cents: int) -> str:
+    bonus = topup_bonus_cents(ctx.clone, cents)
+    return f"\n🎁 {html.escape(ctx.TX('bonus_label', 'Bonus'))}: <b>+{fmt_usd(bonus)}</b>" if bonus else ""
+
+
+async def _handle_custom_amount(client: Client, message: Message, ctx: Ctx, key: Tuple[str, int]) -> None:
+    method = TOPUP_WAIT.get(key)
+    cents = parse_usd_to_cents(message.text or "")
+    if cents is None or not MIN_TOPUP_CENTS <= cents <= MAX_TOPUP_CENTS:
+        await message.reply_text(
+            f"❌ Please send a valid amount between {fmt_usd(MIN_TOPUP_CENTS)} and {fmt_usd(MAX_TOPUP_CENTS)} (example: <code>12.5</code>)."
+        )
+        return
+    TOPUP_WAIT.pop(key, None)
+    oxapay_on, fampay_on = _gateway_flags(ctx)
+    if not {"oxapay": oxapay_on, "fampay": fampay_on}.get(method or ""):
+        await message.reply_text(ctx.T("gateway_error"))
+        return
+    await _create_topup(client, ctx, message.chat.id, message.from_user.id, method, cents, None)
+
+
+async def _show_products(client: Client, ctx: Ctx, chat_id: int, msg, folder_id) -> None:
+    """Folder list (if the store uses folders) -> product list. folder_id: None = top level, '_' = ungrouped."""
+    bot_id = str(ctx.clone["_id"])
+    folders = ctx.clone.get("folders") or []
+    known = {f["id"]: f["name"] for f in folders}
+    everything = await db.list_products(bot_id)
+    title = f"🛍 {ctx.H(ctx.T('collection_title'))}"
+
+    if folder_id is None and folders:
+        counts: dict = {}
+        for p in everything:
+            key = p.get("folder") if p.get("folder") in known else ""
+            counts[key] = counts.get(key, 0) + 1
+        shown = [(f, counts[f["id"]]) for f in folders if counts.get(f["id"])]
+        if shown:
+            text = f"{title}\n{DIVIDER}\n<i>{html.escape(ctx.T('choose_category'))}</i>"
+            await show(client, ctx, chat_id, text, folders_keyboard(shown, counts.get("", 0), ctx.T, ctx.font), "catalog", msg)
+            return
+
+    back = "menu:home"
+    if folder_id is None:
+        items, head = everything, title
+    elif folder_id == "_":
+        items = [p for p in everything if p.get("folder") not in known]
+        head, back = f"📦 {ctx.H(ctx.T('other_products'))}", "menu:products"
+    else:
+        items = [p for p in everything if p.get("folder") == folder_id]
+        head, back = f"🗂 {ctx.H(known.get(folder_id, 'Folder'))}", "menu:products"
+
+    if not items:
+        text = f"{head}\n{DIVIDER}\n{html.escape(ctx.T('no_products'))}"
+        await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "catalog", msg)
+        return
+    text = f"{head}  <b>·</b>  {len(items)} {html.escape(ctx.T('items_label'))}\n{DIVIDER}\n<i>{html.escape(ctx.T('tap_to_view'))}</i>"
+    await show(client, ctx, chat_id, text, products_keyboard(items, ctx.T, ctx.font, fmt_usd, back), "catalog", msg)
+
+
+async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, product_id: str) -> None:
+    bot_id = client.nohara_bot_id
+    msg = query.message
+    chat_id = msg.chat.id if msg else query.from_user.id
+    product = await db.get_product(bot_id, product_id)
+    if not product:
+        await query.answer(ctx.T("something_wrong"), show_alert=True)
+        return
+    await query.answer()
+
+    known = {f["id"] for f in ctx.clone.get("folders") or []}
+    if known:
+        lock_back = f"fold:{product['folder']}" if product.get("folder") in known else "fold:_"
+    else:
+        lock_back = "menu:products"
+    if await _vip_gate(client, ctx, chat_id, query.from_user.id, product, msg, lock_back):
+        return
+
+    gateways = ctx.clone["gateways"]
+    oxapay_on = bool(gateways["oxapay"]["enabled"] and APP_URL)
+    fampay_on = bool(gateways["fampay"]["enabled"] and gateways["fampay"]["upi_id"])
+    in_stock = product["stock"] != 0
+
+    perks = await get_user_perks(ctx.clone, query.from_user.id)
+    final_cents, info = await price_for(ctx.clone, perks, query.from_user.id, product)
+    if info["pct"]:
+        tag = "💎 VIP" if info["source"] == "vip" else f"🎟 {html.escape(info['code'])}"
+        price = f"<s>{fmt_usd(info['list_cents'])}</s> → <b>{fmt_usd(final_cents)}</b>  ({tag} −{info['pct']}%)"
+    else:
+        price = f"<b>{fmt_usd(final_cents)}</b>"
+    if fampay_on:
+        price += f"  (≈ ₹{cents_to_inr(final_cents, ctx.clone['usd_to_inr'])})"
+    stock_text = (
+        ctx.T("unlimited_label") if product["stock"] == -1 else f"{product['stock']} {ctx.T('left_label')}"
+    )
+    text = (
+        f"💎 {ctx.H(product['title'])}\n{DIVIDER}\n"
+        f"💵 {html.escape(ctx.T('price_label'))}: {price}\n"
+        f"📦 {html.escape(ctx.T('stock_label'))}: <b>{html.escape(stock_text)}</b>\n"
+        f"⚡ {html.escape(ctx.T('instant_delivery_line'))}"
+    )
+    if not in_stock:
+        text += f"\n\n{html.escape(ctx.T('out_of_stock_msg'))}"
+
+    known = {f["id"] for f in ctx.clone.get("folders") or []}
+    if known:
+        back_cb = f"fold:{product['folder']}" if product.get("folder") in known else "fold:_"
+    else:
+        back_cb = "menu:products"
+    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, back_cb)
+    await show(client, ctx, chat_id, text, kb, "product" if in_stock else "stock", msg)
+
+
+async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: str, product_id: str) -> None:
+    bot_id = client.nohara_bot_id
+    user_id = query.from_user.id
+    msg = query.message
+    chat_id = msg.chat.id if msg else user_id
+
+    product = await db.get_product(bot_id, product_id)
+    if not product:
+        await query.answer(ctx.T("something_wrong"), show_alert=True)
+        return
+    if product["stock"] == 0:
+        await query.answer(ctx.T("out_of_stock_msg"), show_alert=True)
+        return
+
+    perks = await get_user_perks(ctx.clone, user_id)
+    if product.get("vip_only") and not perks["vip_active"] and not _is_owner(ctx, user_id):
+        await query.answer(ctx.TX("vip_only_alert", "VIP-only product. Join VIP to unlock it."), show_alert=True)
+        return
+    # VIP / coupon discount: from here on `product["price_cents"]` is the price this user really pays
+    final_cents, info = await price_for(ctx.clone, perks, user_id, product)
+    product = {
+        **product,
+        "price_cents": final_cents,
+        "list_price_cents": info["list_cents"],
+        "coupon": info["code"] if info["source"] == "coupon" else "",
+    }
+
+    gateways = ctx.clone["gateways"]
+
+    # ───────────── Wallet ─────────────
+    if method == "wallet":
+        # 1) take one unit of stock (atomic)  2) take the money (atomic)  3) deliver
+        if not await db.reserve_stock(bot_id, product_id):
+            await query.answer(ctx.T("out_of_stock_msg"), show_alert=True)
+            return
+        if not await db.debit(bot_id, user_id, product["price_cents"]):
+            await db.release_stock(bot_id, product_id)
+            await query.answer(ctx.T("insufficient_balance"), show_alert=True)
+            return
+        order = await db.create_order(bot_id, user_id, product, method="wallet", status="paid")
+        await query.answer()
+        try:
+            if msg:
+                await msg.delete()
+        except Exception:
+            pass
+        await fulfill_paid_order(order, stock_reserved=True)
+        return
+
+    # ───────────── OxaPay (crypto) ─────────────
+    if method == "oxapay":
+        api_key = db.get_oxapay_key(ctx.clone)
+        if not (gateways["oxapay"]["enabled"] and api_key and APP_URL):
+            await query.answer(ctx.T("gateway_error"), show_alert=True)
+            return
+        await query.answer()
+        order = await db.create_order(bot_id, user_id, product, method="oxapay", status="pending")
+        invoice = await create_oxapay_invoice(
+            merchant_api_key=api_key,
+            amount_usd=Decimal(product["price_cents"]) / 100,
+            order_id=order["_id"],
+            callback_url=f"{APP_URL}/webhook/oxapay/{bot_id}",
+            description=product["title"],
+        )
+        if not invoice:
+            await db.set_order_fields(order["_id"], status="failed")
+            await client.send_message(chat_id, ctx.T("gateway_error"))
+            return
+        await db.set_order_fields(order["_id"], track_id=str(invoice["track_id"]))
+        text = f"{ctx.H(product['title'])}\n💵 <b>{fmt_usd(product['price_cents'])}</b>\n\n{html.escape(ctx.T('pay_link_msg'))}"
+        kb = payment_link_keyboard(invoice["payment_url"], order["_id"], ctx.T, ctx.font)
+        await show(client, ctx, chat_id, text, kb, banner="oxapay", replace=msg)
+        return
+
+    # ───────────── UPI / FamPay (manual verification by the owner) ─────────────
+    if method == "fampay":
+        upi_id = gateways["fampay"]["upi_id"]
+        if not (gateways["fampay"]["enabled"] and upi_id):
+            await query.answer(ctx.T("gateway_error"), show_alert=True)
+            return
+        await query.answer()
+        amount_inr = cents_to_inr(product["price_cents"], ctx.clone["usd_to_inr"])
+        order = await db.create_order(bot_id, user_id, product, method="upi", status="pending", amount_inr=str(amount_inr))
+        text = ctx.T("upi_instructions", amount=amount_inr, upi=html.escape(upi_id), order_id=order["_id"])
+        await show(client, ctx, chat_id, text, cancel_keyboard(order["_id"], ctx.T, ctx.font), banner="fampay", replace=msg)
+        return
+
+    await query.answer()
+
+
+async def _handle_upi_review(client: Client, query: CallbackQuery, ctx: Ctx, decision: str, order_id: str) -> None:
+    """Owner presses Approve / Reject under a payment proof."""
+    bot_id = client.nohara_bot_id
+    if not _is_owner(ctx, query.from_user.id):
+        await query.answer(ctx.T("owner_only"), show_alert=True)
+        return
+    order = await db.get_order(order_id)
+    if not order or order["bot_id"] != bot_id or order["method"] != "upi":
+        await query.answer("Order not found.", show_alert=True)
+        return
+
+    if decision == "ok":
+        paid = await db.mark_paid(order_id)  # atomic -> a double click can never deliver twice
+        if not paid:
+            await query.answer("Already processed.", show_alert=True)
+            return
+        await query.answer("Approved ✅")
+        await _append_to_message(query.message, "✅ <b>Approved</b>")
+        spawn(fulfill_paid_order(paid, stock_reserved=False))
+    else:
+        if not await db.cancel_order(order_id):
+            await query.answer("Already processed.", show_alert=True)
+            return
+        await query.answer("Rejected")
+        await _append_to_message(query.message, "❌ <b>Rejected</b>")
+        buyer_ctx = await get_ctx(bot_id, order["user_id"])
+        if buyer_ctx:
+            try:
+                await client.send_message(order["user_id"], buyer_ctx.T("upi_rejected"))
+            except Exception:
+                pass
+
+
+async def store_user_message(client: Client, message: Message) -> None:
+    """A buyer sends a UTR / screenshot after choosing UPI payment -> forward to the owner for review."""
+    if not message.from_user:
+        return
+    bot_id = client.nohara_bot_id
+    user_id = message.from_user.id
+    ctx = await get_ctx(bot_id, user_id)
+    if not ctx:
+        return
+
+    if message.text:
+        if await handle_link_input(client, message, ctx):  # owner is typing an Updates / Support link
+            return
+        if (bot_id, user_id) in COUPON_WAIT:  # user is typing a coupon code
+            await _handle_coupon_input(client, message, ctx)
+            return
+        if (bot_id, user_id) in TOPUP_WAIT:  # user is typing a custom top-up amount
+            await _handle_custom_amount(client, message, ctx, (bot_id, user_id))
+            return
+
+    order = await db.get_open_upi_order(bot_id, user_id)
+    if not order:
+        return
+
+    summary = (
+        f"💸 <b>UPI payment proof</b>\n"
+        f"• Order: <code>{order['_id']}</code>\n"
+        f"• Buyer: <code>{user_id}</code> {html.escape(message.from_user.first_name or '')}\n"
+        f"• Product: <b>{html.escape(order['title'])}</b>\n"
+        f"• Amount: <b>₹{order.get('amount_inr', '?')}</b> ({fmt_usd(order['price_cents'])})"
+    )
+    try:
+        await message.forward(ctx.owner_id)
+        await send_ui(client, ctx.owner_id, summary, upi_review_keyboard(order["_id"]))
+    except Exception:
+        log.exception("Could not forward UPI proof to owner")
+        await message.reply_text(ctx.T("something_wrong"))
+        return
+    await message.reply_text(ctx.T("upi_proof_received"))
+    

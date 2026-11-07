@@ -96,4 +96,3 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
             private & (filters.text | filters.photo | filters.document) & ~filters.regex(r"^/"),
         )
     )
-    

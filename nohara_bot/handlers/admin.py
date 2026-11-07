@@ -430,4 +430,161 @@ async def screen_coupons(ctx: Ctx) -> Screen:
     for c in coupons[:20]:
         exp = fmt_date(c["expires_at"]) if c.get("expires_at") else "never"
         limit = c["max_uses"] if c.get("max_uses") else "∞"
-        lines.append(f"🎟 <code>{esc(c['cod
+        lines.append(f"🎟 <code>{esc(c['code'])}</code> — <b>{c['pct']}%</b> · used {c.get('used', 0)}/{limit} · expires {exp}")
+        rows.append([B(f"🗑 {c['code']}", f"adm:cdel:{c['code']}", "danger")])
+    body = "\n".join(lines) if lines else "<i>No coupons yet.</i>"
+    text = (
+        f"🎟 <b>COUPONS</b>\n{DIVIDER}\n{body}\n\n"
+        f"Create: /addcoupon <code>CODE PERCENT [MAX_USES] [DAYS]</code>\n"
+        f"<i>Users redeem a code from the main menu; it is applied to their next purchase (one use per user).</i>"
+    )
+    rows.append([B("◀️ VIP & Rewards", "adm:premium")])
+    return text, markup(rows)
+
+
+async def screen_bc(ctx: Ctx) -> Screen:
+    total = await db.count_users(str(ctx.clone["_id"]))
+    running = str(ctx.clone["_id"]) in BC_RUNNING
+    text = (
+        f"📣 <b>BROADCAST</b>  <i>(free)</i>\n{DIVIDER}\n"
+        f"👥 Users who can receive it: <b>{total}</b>\n"
+        f"{'⏳ A broadcast is running right now.' if running else '✅ Ready.'}\n\n"
+        f"<b>How to send</b>\n"
+        f"1. Text: <code>/broadcast Your message here</code>\n"
+        f"2. Photo / video / any formatted post: send it to this chat first, then <b>reply to it</b> with <code>/broadcast</code>\n\n"
+        f"You will get a preview and must tap <b>Send to all</b> to confirm."
+    )
+    return text, markup([BACK])
+
+
+async def screen_help(ctx: Ctx) -> Screen:
+    return ADMIN_GUIDE + (PLATFORM_GUIDE if ctx.is_master else ""), markup([BACK])
+
+
+SECTIONS = {
+    "home": screen_home, "products": screen_products, "folders": screen_folders, "pay": screen_pay,
+    "images": screen_images, "chan": screen_chan, "fsub": screen_fsub, "look": screen_look,
+    "wallet": screen_wallet, "clones": screen_clones, "help": screen_help, "links": screen_links,
+    "premium": screen_premium, "coupons": screen_coupons, "bc": screen_bc,
+}
+
+
+# ═════════════════════════ Rendering & callbacks ═════════════════════════
+async def render(client, ctx: Ctx, query: CallbackQuery, text: str, kb: Dict[str, Any]) -> None:
+    """Edits the panel in place (smooth); falls back to a fresh message if that is not possible."""
+    msg = query.message
+    try:
+        await botapi.edit_message_text(client.nohara_token, msg.chat.id, msg.id, text, kb)
+    except botapi.BotApiError as exc:
+        if "not modified" in exc.description.lower():
+            return
+        await show(client, ctx, msg.chat.id, text, kb, replace=msg)
+    except Exception:
+        await show(client, ctx, msg.chat.id, text, kb, replace=msg)
+
+
+async def handle_admin_callback(client, query: CallbackQuery, ctx: Ctx, parts: List[str]) -> None:
+    user_id = query.from_user.id
+    if not _is_owner(ctx, user_id):
+        await query.answer(ctx.T("owner_only"), show_alert=True)
+        return
+    bot_id = str(ctx.clone["_id"])
+    section = parts[1] if len(parts) > 1 else "home"
+    arg = parts[2] if len(parts) > 2 else ""
+    note = ""
+
+    if section == "pdel":  # confirmation screen
+        product = await db.get_product(bot_id, arg)
+        await query.answer()
+        if not product:
+            await render(client, ctx, query, *await screen_products(ctx))
+            return
+        text = f"🗑 <b>Delete this product?</b>\n{DIVIDER}\n<b>{esc(product['title'])}</b> — {fmt_usd(product['price_cents'])}\n<i>The file stays in your files channel.</i>"
+        kb = markup([[B("✅ Yes, delete", f"adm:pdelok:{arg}", "danger"), B("✖️ Cancel", "adm:products", "success")]])
+        await render(client, ctx, query, text, kb)
+        return
+
+    if section == "pdelok":
+        note = "Product deleted" if await db.delete_product(bot_id, arg) else "Not found"
+        section = "products"
+    elif section == "fdel":
+        note = "Folder deleted" if await db.delete_folder(bot_id, arg) else "Not found"
+        section = "folders"
+    elif section == "bdel" and arg in BANNER_FIELDS:
+        await db.update_clone_fields(bot_id, {f"ui_branding.{BANNER_FIELDS[arg]}": 0})
+        note = f"Image '{arg}' removed"
+        section = "images"
+    elif section == "linkset" and arg in LINK_LABELS:
+        ADMIN_WAIT[(bot_id, user_id)] = arg
+        await query.answer()
+        prompt = (
+            f"✏️ <b>Set {LINK_LABELS[arg]} link</b>\n{DIVIDER}\n"
+            f"Send the link now as a message:\n<code>https://t.me/yourchannel</code>  or  <code>@yourchannel</code>"
+        )
+        await render(client, ctx, query, prompt, markup([[B("✖️ Cancel", "adm:links", "danger")]]))
+        return
+    elif section == "vipsw" and arg in ("on", "off"):
+        await db.update_clone_fields(bot_id, {"vip.enabled": arg == "on"})
+        note = f"VIP {arg.upper()}"
+        section = "premium"
+    elif section == "refsw" and arg in ("on", "off"):
+        await db.update_clone_fields(bot_id, {"referral.enabled": arg == "on"})
+        note = f"Referral {arg.upper()}"
+        section = "premium"
+    elif section == "cdel":
+        note = "Coupon deleted" if await db.delete_coupon(bot_id, arg) else "Not found"
+        section = "coupons"
+    elif section == "bccancel":
+        BC_PENDING.pop((bot_id, user_id), None)
+        note = "Broadcast cancelled"
+        section = "bc"
+    elif section == "bcgo":
+        source = BC_PENDING.pop((bot_id, user_id), None)
+        if not source:
+            await query.answer("Nothing to send — use /broadcast again.", show_alert=True)
+            return
+        if bot_id in BC_RUNNING:
+            await query.answer("A broadcast is already running.", show_alert=True)
+            return
+        await query.answer("📣 Broadcast started…")
+        spawn(run_broadcast(client, bot_id, query.message.chat.id, source))
+        await render(client, ctx, query, "📣 <b>Broadcast started.</b>\nYou will get a report when it is finished.", markup([BACK]))
+        return
+    elif section == "linkdel" and arg in LINK_LABELS:
+        await db.set_link(bot_id, arg, "")
+        note = f"{LINK_LABELS[arg]} link removed"
+        section = "links"
+    elif section == "fsubdel":
+        try:
+            note = "Channel removed" if await db.remove_fsub(bot_id, int(arg)) else "Not found"
+        except ValueError:
+            note = "Not found"
+        section = "fsub"
+    elif section == "font" and arg in FONT_MODES:
+        await db.update_clone_fields(bot_id, {"font_style": arg})
+        note = "Font updated"
+        section = "look"
+    elif section == "gw" and len(parts) == 4 and parts[2] in ("oxapay", "fampay") and parts[3] in ("on", "off"):
+        gateway, turn_on = parts[2], parts[3] == "on"
+        clone = await db.get_clone(bot_id) or ctx.clone
+        if turn_on and gateway == "oxapay" and not db.get_oxapay_key(clone):
+            await query.answer("Save the API key first:  /setgateway oxapay API_KEY", show_alert=True)
+            return
+        if turn_on and gateway == "fampay" and not clone["gateways"]["fampay"]["upi_id"]:
+            await query.answer("Save your UPI ID first:  /setgateway fampay UPI_ID", show_alert=True)
+            return
+        if gateway == "oxapay":
+            await db.set_oxapay(bot_id, enabled=turn_on)
+        else:
+            await db.set_fampay(bot_id, enabled=turn_on)
+        note = f"{'OxaPay' if gateway == 'oxapay' else 'UPI'} {'enabled' if turn_on else 'disabled'}"
+        section = "pay"
+
+    if section not in SECTIONS:
+        section = "home"
+    await query.answer(note or None)
+    fresh = await db.get_clone(bot_id)
+    if fresh:
+        ctx = Ctx(fresh, ctx.lang)
+    text, kb = await SECTIONS[section](ctx)
+    await render(client, ctx, query, text, kb)

@@ -126,4 +126,3 @@ async def ensure_owner_menu(client, bot_id: str, user_id: int, is_master: bool =
         return
     if await set_owner_menu(client, user_id, is_master):
         _OWNER_MENU_DONE.add(key)
-     
