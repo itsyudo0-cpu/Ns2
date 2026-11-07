@@ -9,7 +9,7 @@ The messages are delivered through the official Bot API (see botapi.py / service
 Set BUTTON_COLORS=false in the environment to turn colours off.
 """
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from nohara_bot.config import BUTTON_COLORS
 from nohara_bot.fonts import style_text
@@ -39,23 +39,88 @@ btn = _btn
 markup = _markup
 
 
-def main_menu(T: Callable[..., str], font: str, is_owner: bool = False, is_master: bool = False) -> Markup:
+def _t(T: Callable[..., str], key: str, default: str) -> str:
+    """Translation with an English default for keys that have no translation yet."""
+    value = T(key)
+    return default if value == key else value
+
+
+TOPUP_AMOUNTS_CENTS = (100, 500, 1000, 2000, 5000, 10000)  # $1 $5 $10 $20 $50 $100
+
+
+def main_menu(
+    T: Callable[..., str],
+    font: str,
+    is_owner: bool = False,
+    is_master: bool = False,
+    links: Optional[Dict[str, str]] = None,
+    vip_on: bool = True,
+    ref_on: bool = True,
+) -> Markup:
     rows = [
         [_btn("🛍 " + T("btn_view_products"), font, "primary", "menu:products")],
         [_btn("👛 " + T("btn_wallet"), font, "success", "menu:wallet"), _btn("🌐 " + T("btn_change_lang"), font, "success", "menu:lang")],
     ]
+    perks = []
+    if vip_on:
+        perks.append(_btn("💎 " + _t(T, "btn_vip", "VIP Membership"), font, "primary", "menu:vip"))
+    if ref_on:
+        perks.append(_btn("🎁 " + _t(T, "btn_refer", "Refer & Earn"), font, "primary", "menu:ref"))
+    if perks:
+        rows.append(perks)
+    coupon = _btn("🎟 " + _t(T, "btn_coupon", "Redeem Coupon"), font, "success", "menu:coupon")
+    topup = _btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "success", "menu:topup")
     if is_master:
-        rows.append([_btn("🧬 " + T("btn_clone_bot"), font, "primary", "menu:clone")])
+        rows.append([coupon])
+        rows.append([_btn("🧬 " + T("btn_clone_bot"), font, "primary", "menu:clone"), topup])
+    else:
+        rows.append([coupon, topup])
+    links = links or {}
+    link_row = []
+    if links.get("updates_url"):
+        link_row.append(_btn("📢 " + _t(T, "btn_updates", "Updates Channel"), font, "primary", url=links["updates_url"]))
+    if links.get("support_url"):
+        link_row.append(_btn("💬 " + _t(T, "btn_support", "Support"), font, "primary", url=links["support_url"]))
+    if link_row:
+        rows.append(link_row)
     if is_owner:
         rows.append([_btn("⚙️ " + T("btn_open_dashboard"), font, "success", "menu:dash")])
     return _markup(rows)
+
+
+def vip_keyboard(T: Callable[..., str], font: str, buy_label: str) -> Markup:
+    return _markup([
+        [_btn("💎 " + buy_label, font, "primary", "vip:buy")],
+        [_btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "success", "menu:topup"), _btn("🏠 " + T("btn_home"), font, "success", "menu:home")],
+    ])
+
+
+def vip_locked_keyboard(T: Callable[..., str], font: str, back_cb: str = "menu:products") -> Markup:
+    return _markup([
+        [_btn("💎 " + _t(T, "btn_vip_get", "Get VIP Access"), font, "primary", "menu:vip")],
+        [_btn("◀️ " + T("btn_back"), font, "success", back_cb)],
+    ])
+
+
+def referral_keyboard(T: Callable[..., str], font: str, share_url: str) -> Markup:
+    return _markup([
+        [_btn("📤 " + _t(T, "btn_share", "Share My Link"), font, "primary", url=share_url)],
+        [_btn("🏠 " + T("btn_home"), font, "success", "menu:home")],
+    ])
+
+
+def after_coupon_keyboard(T: Callable[..., str], font: str) -> Markup:
+    return _markup([
+        [_btn("🛍 " + T("btn_view_products"), font, "primary", "menu:products")],
+        [_btn("🏠 " + T("btn_home"), font, "success", "menu:home")],
+    ])
 
 
 def products_keyboard(products: List[Dict], T: Callable[..., str], font: str, price_fmt: Callable[[int], str], back_cb: str = "menu:home") -> Markup:
     rows = []
     for p in products:
         out = p["stock"] == 0
-        label = f"{p['title']} — {price_fmt(p['price_cents'])}" + (" ✖" if out else "")
+        label = ("💎 " if p.get("vip_only") else "") + f"{p['title']} — {price_fmt(p['price_cents'])}" + (" ✖" if out else "")
         rows.append([_btn(label, font, "danger" if out else "primary", f"prod:{p['_id']}")])
     label = ("🏠 " + T("btn_home")) if back_cb == "menu:home" else ("◀️ " + T("btn_back"))
     rows.append([_btn(label, font, "success", back_cb)])
@@ -114,6 +179,43 @@ def back_keyboard(T: Callable[..., str], font: str) -> Markup:
     return _markup([[_btn("🏠 " + T("btn_home"), font, "success", "menu:home")]])
 
 
+def wallet_keyboard(T: Callable[..., str], font: str) -> Markup:
+    return _markup([
+        [_btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "success", "menu:topup")],
+        [_btn("🏠 " + T("btn_home"), font, "success", "menu:home")],
+    ])
+
+
+def topup_methods_keyboard(T: Callable[..., str], font: str, oxapay_on: bool, fampay_on: bool) -> Markup:
+    row = []
+    if oxapay_on:
+        row.append(_btn("🪙 " + T("btn_pay_oxapay"), font, "primary", "top:m:oxapay"))
+    if fampay_on:
+        row.append(_btn("🇮🇳 " + T("btn_pay_fampay"), font, "primary", "top:m:fampay"))
+    rows = [row] if row else []
+    rows.append([_btn("🏠 " + T("btn_home"), font, "success", "menu:home")])
+    return _markup(rows)
+
+
+def topup_amount_keyboard(method: str, T: Callable[..., str], font: str) -> Markup:
+    rows: List[List[Button]] = []
+    row: List[Button] = []
+    for cents in TOPUP_AMOUNTS_CENTS:
+        row.append(_btn(f"${cents // 100}", font, "primary", f"top:a:{method}:{cents}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn("✍️ " + _t(T, "btn_custom_amount", "Custom amount"), font, "success", f"top:c:{method}")])
+    rows.append([_btn("◀️ " + T("btn_back"), font, "success", "menu:topup")])
+    return _markup(rows)
+
+
+def topup_cancel_keyboard(T: Callable[..., str], font: str) -> Markup:
+    return _markup([[_btn("✖️ " + T("btn_cancel_order"), font, "danger", "menu:topup")]])
+
+
 def language_keyboard(T: Callable[..., str], font: str) -> Markup:
     rows: List[List[Button]] = []
     row: List[Button] = []
@@ -144,3 +246,4 @@ def upi_review_keyboard(order_id: str) -> Markup:
         _btn("Approve", "default_html", "success", f"upi:ok:{order_id}"),
         _btn("Reject", "default_html", "danger", f"upi:no:{order_id}"),
     ]])
+  
