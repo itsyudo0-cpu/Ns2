@@ -25,19 +25,19 @@ from cryptography.fernet import Fernet, InvalidToken
 # ╚══════════════════════════════════════════════════════════════════════════╝
 MY_VALUES = {
     # my.telegram.org से (सिर्फ़ नंबर), जैसे "1234567"
-    "API_ID": "26944587",
+    "API_ID": "",
     # my.telegram.org से
-    "API_HASH": "7261a455f2a6159b8a2fbfecd1a63004",
+    "API_HASH": "",
     # @BotFather से master बॉट का टोकन, जैसे "123456789:AAH..."
-    "MASTER_BOT_TOKEN": "9052932129:AAFMH0ywKmvArMWiUnrVIsiLjf5gE27WN0c",
+    "MASTER_BOT_TOKEN": "",
     # MongoDB Atlas connection string, जैसे "mongodb+srv://user:pass@cluster0.xxxx.mongodb.net/?retryWrites=true&w=majority"
-    "MONGO_URI": "mongodb+srv://itsyudo0_db_user:CR4HGDttw9JkMqYT@cluster0.lgu6ocy.mongodb.net/?compressors=zlib",
+    "MONGO_URI": "",
     # कोई भी लंबा रैंडम टेक्स्ट (कम से कम 32, बेहतर 50 अक्षर, बिना space). एक बार भरकर कभी न बदलें!
-    "ENCRYPTION_KEY": "7c2_example_encrypted_key_placeholder_to_replace_with_real_one",
+    "ENCRYPTION_KEY": "",
     # आपकी Telegram user ID; एक से ज़्यादा हों तो कॉमा से अलग करें: "111,222"
-    "ADMIN_IDS": "7955232487",
+    "ADMIN_IDS": "",
     # (वैकल्पिक) master audit channel की ID, जैसे "-1001234567890". नहीं चाहिए तो "0"
-    "MASTER_AUDIT_CHANNEL_ID": "-1004396112942",
+    "MASTER_AUDIT_CHANNEL_ID": "0",
     # (वैकल्पिक) अपना custom domain हो तभी भरें, वरना खाली छोड़ दें (Render का URL अपने आप मिल जाता है)
     "APP_URL": "",
 
@@ -112,6 +112,8 @@ MASTER_BOT_TOKEN = _required("MASTER_BOT_TOKEN")
 
 # Telegram user IDs of platform admins (comma separated). They can manage any clone.
 ADMIN_IDS = _int_list("ADMIN_IDS")
+if not ADMIN_IDS:
+    _fail("'ADMIN_IDS' is empty. Put YOUR Telegram user id in MY_VALUES (you are the owner of the master store).")
 
 # Private channel where the MASTER bot posts audit logs (master bot must be admin there).
 # 0 = disabled.
