@@ -11,6 +11,7 @@ from hydrogram.types import CallbackQuery, Message
 from typing import Optional
 
 from nohara_bot.buttons import (
+    folders_keyboard,
     back_keyboard,
     cancel_keyboard,
     language_keyboard,
@@ -30,7 +31,7 @@ from nohara_bot.handlers.common import (
     show,
     show_home,
 )
-from nohara_bot.handlers.owner import dashboard_text
+from nohara_bot.handlers.admin import handle_admin_callback, screen_home
 from nohara_bot.i18n import SUPPORTED_LANG_CODES
 from nohara_bot.payments import create_oxapay_invoice
 from nohara_bot.services.core import (
@@ -81,7 +82,8 @@ async def store_help(client: Client, message: Message) -> None:
     if not ctx:
         return
     if _is_owner(ctx, message.from_user.id):
-        await message.reply_text(await dashboard_text(client.nohara_bot_id, ctx))
+        text, kb = await screen_home(ctx)
+        await send_ui(client, message.chat.id, text, kb)
     else:
         await show_home(client, ctx, message.chat.id, message.from_user.id, name=message.from_user.first_name or "")
 
@@ -138,6 +140,10 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
             await show_home(client, ctx, chat_id, user_id, replace=msg, name=query.from_user.first_name or "")
             return
 
+        if action == "adm":
+            await handle_admin_callback(client, query, ctx, parts)
+            return
+
         if action == "upi" and len(parts) == 3:
             await _handle_upi_review(client, query, ctx, parts[1], parts[2])
             return
@@ -149,6 +155,11 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
 
         if action == "menu" and len(parts) == 2:
             await _handle_menu(client, query, ctx, parts[1])
+            return
+
+        if action == "fold" and len(parts) == 2:
+            await query.answer()
+            await _show_products(client, ctx, chat_id, msg, parts[1])
             return
 
         if action == "prod" and len(parts) == 2:
@@ -180,17 +191,7 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
 
     elif target == "products":
         await query.answer()
-        products = await db.list_products(bot_id)
-        if not products:
-            empty = f"🛍 {ctx.H(ctx.T('collection_title'))}\n{DIVIDER}\n{html.escape(ctx.T('no_products'))}"
-            await show(client, ctx, chat_id, empty, back_keyboard(ctx.T, ctx.font), "catalog", msg)
-            return
-        kb = products_keyboard(products, ctx.T, ctx.font, fmt_usd)
-        text = (
-            f"🛍 {ctx.H(ctx.T('collection_title'))}  <b>·</b>  {len(products)} {html.escape(ctx.T('items_label'))}\n"
-            f"{DIVIDER}\n<i>{html.escape(ctx.T('tap_to_view'))}</i>"
-        )
-        await show(client, ctx, chat_id, text, kb, "catalog", msg)
+        await _show_products(client, ctx, chat_id, msg, None)
 
     elif target == "wallet":
         await query.answer()
@@ -212,7 +213,8 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
             await query.answer(ctx.T("owner_only"), show_alert=True)
             return
         await query.answer()
-        await show(client, ctx, chat_id, await dashboard_text(bot_id, ctx), back_keyboard(ctx.T, ctx.font), replace=msg)
+        text, kb = await screen_home(ctx)
+        await show(client, ctx, chat_id, text, kb, replace=msg)
 
     elif target == "clone" and ctx.is_master:
         await query.answer()
@@ -220,6 +222,43 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
 
     else:
         await query.answer()
+
+
+async def _show_products(client: Client, ctx: Ctx, chat_id: int, msg, folder_id) -> None:
+    """Folder list (if the store uses folders) -> product list. folder_id: None = top level, '_' = ungrouped."""
+    bot_id = str(ctx.clone["_id"])
+    folders = ctx.clone.get("folders") or []
+    known = {f["id"]: f["name"] for f in folders}
+    everything = await db.list_products(bot_id)
+    title = f"🛍 {ctx.H(ctx.T('collection_title'))}"
+
+    if folder_id is None and folders:
+        counts: dict = {}
+        for p in everything:
+            key = p.get("folder") if p.get("folder") in known else ""
+            counts[key] = counts.get(key, 0) + 1
+        shown = [(f, counts[f["id"]]) for f in folders if counts.get(f["id"])]
+        if shown:
+            text = f"{title}\n{DIVIDER}\n<i>{html.escape(ctx.T('choose_category'))}</i>"
+            await show(client, ctx, chat_id, text, folders_keyboard(shown, counts.get("", 0), ctx.T, ctx.font), "catalog", msg)
+            return
+
+    back = "menu:home"
+    if folder_id is None:
+        items, head = everything, title
+    elif folder_id == "_":
+        items = [p for p in everything if p.get("folder") not in known]
+        head, back = f"📦 {ctx.H(ctx.T('other_products'))}", "menu:products"
+    else:
+        items = [p for p in everything if p.get("folder") == folder_id]
+        head, back = f"🗂 {ctx.H(known.get(folder_id, 'Folder'))}", "menu:products"
+
+    if not items:
+        text = f"{head}\n{DIVIDER}\n{html.escape(ctx.T('no_products'))}"
+        await show(client, ctx, chat_id, text, back_keyboard(ctx.T, ctx.font), "catalog", msg)
+        return
+    text = f"{head}  <b>·</b>  {len(items)} {html.escape(ctx.T('items_label'))}\n{DIVIDER}\n<i>{html.escape(ctx.T('tap_to_view'))}</i>"
+    await show(client, ctx, chat_id, text, products_keyboard(items, ctx.T, ctx.font, fmt_usd, back), "catalog", msg)
 
 
 async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, product_id: str) -> None:
@@ -252,8 +291,13 @@ async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, produc
     if not in_stock:
         text += f"\n\n{html.escape(ctx.T('out_of_stock_msg'))}"
 
-    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on)
-    await show(client, ctx, chat_id, text, kb, "catalog" if in_stock else "stock", msg)
+    known = {f["id"] for f in ctx.clone.get("folders") or []}
+    if known:
+        back_cb = f"fold:{product['folder']}" if product.get("folder") in known else "fold:_"
+    else:
+        back_cb = "menu:products"
+    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, back_cb)
+    await show(client, ctx, chat_id, text, kb, "product" if in_stock else "stock", msg)
 
 
 async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: str, product_id: str) -> None:
@@ -314,7 +358,7 @@ async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: st
         await db.set_order_fields(order["_id"], track_id=str(invoice["track_id"]))
         text = f"{ctx.H(product['title'])}\n💵 <b>{fmt_usd(product['price_cents'])}</b>\n\n{html.escape(ctx.T('pay_link_msg'))}"
         kb = payment_link_keyboard(invoice["payment_url"], order["_id"], ctx.T, ctx.font)
-        await show(client, ctx, chat_id, text, kb, replace=msg)
+        await show(client, ctx, chat_id, text, kb, banner="oxapay", replace=msg)
         return
 
     # ───────────── UPI / FamPay (manual verification by the owner) ─────────────
@@ -327,7 +371,7 @@ async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: st
         amount_inr = cents_to_inr(product["price_cents"], ctx.clone["usd_to_inr"])
         order = await db.create_order(bot_id, user_id, product, method="upi", status="pending", amount_inr=str(amount_inr))
         text = ctx.T("upi_instructions", amount=amount_inr, upi=html.escape(upi_id), order_id=order["_id"])
-        await show(client, ctx, chat_id, text, cancel_keyboard(order["_id"], ctx.T, ctx.font), replace=msg)
+        await show(client, ctx, chat_id, text, cancel_keyboard(order["_id"], ctx.T, ctx.font), banner="fampay", replace=msg)
         return
 
     await query.answer()
@@ -394,3 +438,4 @@ async def store_user_message(client: Client, message: Message) -> None:
         await message.reply_text(ctx.T("something_wrong"))
         return
     await message.reply_text(ctx.T("upi_proof_received"))
+    
