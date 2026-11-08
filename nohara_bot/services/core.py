@@ -241,7 +241,7 @@ async def get_user_perks(clone: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     return {
         "user": user,
         "vip_until": vip_until,
-        "vip_active": bool(vip_cfg(clone)["enabled"] and vip_until > int(time.time())),
+        "vip_active": bool(is_premium(clone) and vip_cfg(clone)["enabled"] and vip_until > int(time.time())),
     }
 
 
@@ -253,7 +253,7 @@ async def price_for(clone: Dict[str, Any], perks: Dict[str, Any], user_id: int, 
     if perks.get("vip_active"):
         pct, source = int(vip_cfg(clone)["discount_pct"]), "vip"
     active = (perks.get("user") or {}).get("coupon")
-    if active:
+    if active and is_premium(clone):
         coupon = await db.get_coupon(str(clone["_id"]), active.get("code", ""))
         if coupon_is_valid(coupon, user_id) and int(coupon["pct"]) > pct:
             pct, source, code = int(coupon["pct"]), "coupon", coupon["code"]
@@ -268,7 +268,7 @@ async def reward_referrer(bot_id: str, user_id: int, paid_cents: int) -> None:
         if not clone:
             return
         cfg = referral_cfg(clone)
-        if not cfg["enabled"] or int(cfg["bonus_cents"]) <= 0 or int(paid_cents) < int(cfg["min_paid_cents"]):
+        if not is_premium(clone) or not cfg["enabled"] or int(cfg["bonus_cents"]) <= 0 or int(paid_cents) < int(cfg["min_paid_cents"]):
             return
         doc = await db.claim_referral_reward(bot_id, user_id)
         if not doc:
@@ -287,6 +287,71 @@ async def reward_referrer(bot_id: str, user_id: int, paid_cents: int) -> None:
                 pass
     except Exception:
         log.exception("Referral reward failed")
+
+
+# ───────────────────────── Premium plan (for clone owners) ─────────────────────────
+# VIP membership, Referral and Coupons are PREMIUM features of a clone: the clone owner buys a Premium plan
+# (1–12 months, price per duration set by the MASTER owner) with the wallet he has in the MASTER bot.
+PREMIUM_FEATURES = "VIP Membership · Refer & Earn · Coupons"
+
+
+def is_premium(clone: Optional[Dict[str, Any]]) -> bool:
+    if not clone:
+        return False
+    return bool(clone.get("is_master")) or int(clone.get("premium_until") or 0) > int(time.time())
+
+
+def month_label(months: int) -> str:
+    return f"{months} Month" + ("" if months == 1 else "s")
+
+
+def plans_from(raw: Any) -> List[Any]:
+    """{"1": 500, "3": 1200} -> [(1, 500), (3, 1200)]  (only months 1..12 with a price above 0)."""
+    plans = []
+    for key, cents in (raw or {}).items():
+        try:
+            months, price = int(key), int(cents or 0)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= months <= 12 and price > 0:
+            plans.append((months, price))
+    return sorted(plans)
+
+
+def vip_plans(clone: Dict[str, Any]) -> List[Any]:
+    """The VIP plans a buyer can choose from. No plan configured yet -> one default 1-month plan."""
+    return plans_from(clone.get("vip_plans")) or [(1, int(vip_cfg(clone)["price_cents"]))]
+
+
+async def get_master_clone() -> Optional[Dict[str, Any]]:
+    return await db.get_master_clone()
+
+
+async def premium_plans() -> List[Any]:
+    master = await get_master_clone()
+    return plans_from((master or {}).get("premium_plans"))
+
+
+async def purchase_premium(clone: Dict[str, Any], user_id: int, months: int) -> Dict[str, Any]:
+    """Pays with the buyer's wallet in the MASTER bot. Returns {"status": ok|no_plan|no_balance|error, ...}."""
+    master = await get_master_clone()
+    price = dict(plans_from((master or {}).get("premium_plans"))).get(int(months))
+    if not master or not price:
+        return {"status": "no_plan"}
+    if not await db.debit(str(master["_id"]), user_id, price):
+        return {"status": "no_balance", "price": price, "balance": await db.get_balance(str(master["_id"]), user_id)}
+    until = await db.extend_premium(str(clone["_id"]), int(months) * 30)
+    text = (
+        f"💎 <b>[PREMIUM PURCHASED]</b>\n• Bot: <code>{html.escape(str(clone.get('bot_username', '')))}</code> (<code>{clone['_id']}</code>)\n"
+        f"• Buyer: <code>{user_id}</code> | Plan: <b>{month_label(months)}</b> | Paid: <b>{fmt_usd(price)}</b> | Until: {fmt_date(until)}"
+    )
+    master_client = MASTER.get("client")
+    if master_client and master.get("owner_id"):
+        try:
+            await master_client.send_message(int(master["owner_id"]), text)
+        except Exception:
+            log.warning("Could not notify the master owner about a premium purchase")
+    return {"status": "ok", "price": price, "until": until}
 
 
 # ───────────────────────── Audit & notifications ─────────────────────────
@@ -424,4 +489,3 @@ async def fulfill_paid_order(order: Dict[str, Any], stock_reserved: bool = False
         )
         await send_audit(clone, _audit_line("DELIVERY FAILED — REFUNDED", clone, order))
     return False
-    
