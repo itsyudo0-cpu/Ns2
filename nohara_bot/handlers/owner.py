@@ -30,6 +30,8 @@ from nohara_bot.services.core import (
     Ctx,
     fmt_date,
     fmt_usd,
+    is_premium,
+    month_label,
     parse_usd_to_cents,
     send_audit,
 )
@@ -505,27 +507,30 @@ async def cmd_broadcast(client: Client, message: Message, ctx: Ctx) -> None:
 
 @owner_only
 async def cmd_setvip(client: Client, message: Message, ctx: Ctx) -> None:
+    """/setvip 15 → VIP discount percent · /setvip on|off · plans (months + price): /setvipplan"""
+    if await _premium_gate(message, ctx):
+        return
     args = _args(message)
     bot_id = client.nohara_bot_id
     if len(args) == 1 and args[0].lower() in ("on", "off"):
         await db.update_clone_fields(bot_id, {"vip.enabled": args[0].lower() == "on"})
         await message.reply_text(f"✅ VIP membership is now <b>{args[0].upper()}</b>.")
         return
-    price = parse_usd_to_cents(args[0]) if len(args) == 3 else None
-    ok_days = len(args) == 3 and args[1].isdigit() and 1 <= int(args[1]) <= 3650
-    ok_pct = len(args) == 3 and args[2].isdigit() and 1 <= int(args[2]) <= 90
-    if not (price and ok_days and ok_pct):
-        await message.reply_text(
-            "<b>Usage:</b> <code>/setvip PRICE_USD DAYS DISCOUNT_PERCENT</code>\nExample: <code>/setvip 5 30 15</code> → $5 for 30 days, 15% off everything.\n"
-            "Switch on/off: <code>/setvip on</code> · <code>/setvip off</code>"
-        )
+    if len(args) == 1 and args[0].isdigit() and 1 <= int(args[0]) <= 90:
+        await db.update_clone_fields(bot_id, {"vip.discount_pct": int(args[0]), "vip.enabled": True})
+        await message.reply_text(f"✅ <b>VIP discount saved:</b> {args[0]}% off every product for VIP members.")
         return
-    await db.update_clone_fields(bot_id, {"vip.price_cents": price, "vip.days": int(args[1]), "vip.discount_pct": int(args[2]), "vip.enabled": True})
-    await message.reply_text(f"✅ <b>VIP saved:</b> {fmt_usd(price)} for {args[1]} days · {args[2]}% off every product.")
+    await message.reply_text(
+        "<b>Usage:</b>\n<code>/setvip 15</code> — VIP members get 15% off (1–90)\n"
+        "<code>/setvip on</code> · <code>/setvip off</code>\n"
+        "<code>/setvipplan MONTHS PRICE_USD</code> — add a plan, e.g. <code>/setvipplan 3 12</code>"
+    )
 
 
 @owner_only
 async def cmd_setreferral(client: Client, message: Message, ctx: Ctx) -> None:
+    if await _premium_gate(message, ctx):
+        return
     args = _args(message)
     bot_id = client.nohara_bot_id
     if len(args) == 1 and args[0].lower() in ("on", "off"):
@@ -576,6 +581,8 @@ async def cmd_settopupbonus(client: Client, message: Message, ctx: Ctx) -> None:
 
 @owner_only
 async def cmd_addcoupon(client: Client, message: Message, ctx: Ctx) -> None:
+    if await _premium_gate(message, ctx):
+        return
     args = _args(message)
     code = args[0].upper() if args else ""
     ok_code = bool(re.fullmatch(r"[A-Z0-9_-]{3,20}", code))
@@ -601,6 +608,8 @@ async def cmd_addcoupon(client: Client, message: Message, ctx: Ctx) -> None:
 
 @owner_only
 async def cmd_delcoupon(client: Client, message: Message, ctx: Ctx) -> None:
+    if await _premium_gate(message, ctx):
+        return
     args = _args(message)
     if not args:
         await message.reply_text("<b>Usage:</b> <code>/delcoupon CODE</code>")
@@ -611,6 +620,8 @@ async def cmd_delcoupon(client: Client, message: Message, ctx: Ctx) -> None:
 
 @owner_only
 async def cmd_coupons(client: Client, message: Message, ctx: Ctx) -> None:
+    if await _premium_gate(message, ctx):
+        return
     coupons = await db.list_coupons(client.nohara_bot_id)
     if not coupons:
         await message.reply_text("No coupons yet. Create one: <code>/addcoupon CODE PERCENT [MAX_USES] [DAYS]</code>")
@@ -625,6 +636,8 @@ async def cmd_coupons(client: Client, message: Message, ctx: Ctx) -> None:
 
 @owner_only
 async def cmd_vipproduct(client: Client, message: Message, ctx: Ctx) -> None:
+    if await _premium_gate(message, ctx):
+        return
     args = _args(message)
     if len(args) != 2 or args[1].lower() not in ("on", "off"):
         await message.reply_text(
@@ -636,3 +649,74 @@ async def cmd_vipproduct(client: Client, message: Message, ctx: Ctx) -> None:
         await message.reply_text("❌ Product not found. Check the ID with /products.")
         return
     await message.reply_text("💎 Product is now <b>VIP-only</b>." if args[1].lower() == "on" else "✅ Product is now available to everyone.")
+
+
+async def _premium_gate(message: Message, ctx: Ctx) -> bool:
+    """True (and a message is sent) when this store has no Premium: VIP / referral / coupons are Premium features."""
+    if is_premium(ctx.clone):
+        return False
+    await message.reply_text(
+        "🔒 <b>Premium required.</b>\nVIP Membership, Refer &amp; Earn and Coupons are Premium features.\nOpen /admin → <b>💎 Get Premium</b>."
+    )
+    return True
+
+
+async def _save_plan(message: Message, field: str, args: list, bot_id: str, usage: str) -> None:
+    ok_months = len(args) == 2 and args[0].isdigit() and 1 <= int(args[0]) <= 12
+    price = 0 if len(args) == 2 and args[1].lower() in ("0", "off") else (parse_usd_to_cents(args[1]) if len(args) == 2 else None)
+    if not ok_months or price is None or price > 1_000_000:
+        await message.reply_text(usage)
+        return
+    await db.update_clone_fields(bot_id, {f"{field}.{int(args[0])}": price})
+    await message.reply_text(
+        f"✅ <b>{month_label(int(args[0]))}</b> plan " + (f"saved: <b>{fmt_usd(price)}</b>" if price else "removed") + "."
+    )
+
+
+@owner_only
+async def cmd_setvipplan(client: Client, message: Message, ctx: Ctx) -> None:
+    if await _premium_gate(message, ctx):
+        return
+    await _save_plan(
+        message, "vip_plans", _args(message), client.nohara_bot_id,
+        "<b>Usage:</b> <code>/setvipplan MONTHS PRICE_USD</code> (MONTHS 1–12)\nExample: <code>/setvipplan 3 12</code> → 3 months for $12.\n"
+        "Remove a plan: <code>/setvipplan 3 0</code>. You can also use /admin → 💎 VIP &amp; Rewards → 🗓 VIP Plans.",
+    )
+
+
+@owner_only
+async def cmd_setpremium(client: Client, message: Message, ctx: Ctx) -> None:
+    """MASTER owner only: the price clone owners pay for Premium, per number of months."""
+    if not ctx.is_master:
+        await message.reply_text("⚠️ Only the platform (master) owner can set Premium prices.")
+        return
+    await _save_plan(
+        message, "premium_plans", _args(message), client.nohara_bot_id,
+        "<b>Usage:</b> <code>/setpremium MONTHS PRICE_USD</code> (MONTHS 1–12)\nExample: <code>/setpremium 1 5</code> · <code>/setpremium 6 25</code>\n"
+        "Remove a plan: <code>/setpremium 6 0</code>. Or use /admin → 👑 Premium Plans.",
+    )
+
+
+@owner_only
+async def cmd_grantpremium(client: Client, message: Message, ctx: Ctx) -> None:
+    """MASTER owner only: gift Premium time to a clone, e.g. /grantpremium BOT_ID 3"""
+    if not ctx.is_master:
+        await message.reply_text("⚠️ Only the platform (master) owner can grant Premium.")
+        return
+    args = _args(message)
+    if len(args) != 2 or not args[1].isdigit() or not 1 <= int(args[1]) <= 36:
+        await message.reply_text("<b>Usage:</b> <code>/grantpremium BOT_ID MONTHS</code>\nFind BOT_IDs in /admin → 🧬 Clone Bots.")
+        return
+    target = await db.get_clone(args[0])
+    if not target or target.get("is_master"):
+        await message.reply_text("❌ Clone bot not found.")
+        return
+    until = await db.extend_premium(str(target["_id"]), int(args[1]) * 30)
+    await message.reply_text(f"✅ {html.escape(str(target.get('bot_username', '')))} now has Premium until <b>{fmt_date(until)}</b>.")
+    try:
+        await client.send_message(
+            int(target["owner_id"]),
+            f"🎁 <b>Premium activated</b> for {html.escape(str(target.get('bot_username', '')))} until <b>{fmt_date(until)}</b>.\nVIP, Refer &amp; Earn and Coupons are unlocked — open /admin → 💎 VIP &amp; Rewards.",
+        )
+    except Exception:
+        pass

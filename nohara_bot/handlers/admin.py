@@ -24,11 +24,17 @@ from nohara_bot.services.core import (
     Ctx,
     fmt_date,
     fmt_usd,
+    is_premium,
+    month_label,
+    parse_usd_to_cents,
+    plans_from,
+    purchase_premium,
     referral_cfg,
     send_ui,
     spawn,
     topup_tiers,
     vip_cfg,
+    vip_plans,
 )
 
 FONT = "default_html"
@@ -88,8 +94,11 @@ ADMIN_GUIDE = (
     "/setoxapayimage · /setfampayimage — send a photo with the command as caption\n"
     "/delbanner <code>NAME</code> · /setfont <code>MODE</code> · /setlang <code>hi</code> · /setwelcome <code>text</code>\n\n"
     "<b>VIP &amp; rewards</b>\n"
-    "/setvip <code>PRICE DAYS DISCOUNT%</code> · /setreferral <code>BONUS_USD</code> · /settopupbonus <code>10:5 25:10</code>\n"
+    "🔒 Premium: /setvip <code>DISCOUNT%</code> · /setvipplan <code>MONTHS PRICE</code> · /setreferral <code>BONUS_USD</code>\n"
+    "/settopupbonus <code>10:5 25:10</code> (free for all)\n"
     "/addcoupon <code>CODE PERCENT [MAX_USES] [DAYS]</code> · /delcoupon <code>CODE</code> · /coupons · /vipproduct <code>ID on|off</code>\n\n"
+    "<b>Premium plan (platform owner only)</b>\n"
+    "/setpremium <code>MONTHS PRICE</code> · /grantpremium <code>BOT_ID MONTHS</code>\n\n"
     "<b>Broadcast (free)</b>\n"
     "/broadcast <code>text</code> — or reply to any message with /broadcast\n\n"
     "<b>Users &amp; wallet</b>\n"
@@ -134,6 +143,7 @@ async def screen_home(ctx: Ctx) -> Screen:
     if clone.get("is_master"):
         rows.append([B("🧬 Clone Bots", "adm:clones", "primary")])
     rows.append([B("📣 Broadcast", "adm:bc", "primary"), B("💎 VIP & Rewards", "adm:premium", "primary")])
+    rows.append([B("👑 Premium Plans", "adm:plans:pp", "primary")] if clone.get("is_master") else [B("💎 Get Premium", "adm:prem", "primary")])
     rows.append([B("🔗 Links", "adm:links", "primary"), B("📖 Command Guide", "adm:help")])
     rows.append([B("🏠 Back to Store", "menu:home")])
     return text, markup(rows)
@@ -292,7 +302,9 @@ async def screen_wallet(ctx: Ctx) -> Screen:
 async def screen_clones(ctx: Ctx) -> Screen:
     clones = await db.list_all_clones(15)
     lines = [
-        f"{'🟢' if c['_id'] in ACTIVE_CLONE_CLIENTS else '🔴'} {esc(c.get('bot_username', ''))} · owner <code>{c['owner_id']}</code>\n   <code>{c['_id']}</code>"
+        f"{'🟢' if c['_id'] in ACTIVE_CLONE_CLIENTS else '🔴'} {esc(c.get('bot_username', ''))} · owner <code>{c['owner_id']}</code> · "
+        + (f"💎 until {fmt_date(c['premium_until'])}" if is_premium(c) else "free")
+        + f"\n   <code>{c['_id']}</code>"
         for c in clones
     ]
     text = (
@@ -335,6 +347,23 @@ async def handle_link_input(client, message, ctx: Ctx) -> bool:
     if not _is_owner(ctx, message.from_user.id):
         ADMIN_WAIT.pop(key, None)
         return False
+    if which.startswith("plan:"):  # the owner is sending the price of one plan
+        _, kind, months = which.split(":")
+        text = (message.text or "").strip().lower()
+        cents = 0 if text in ("0", "off", "remove") else parse_usd_to_cents(text)
+        if cents is None or cents > 1_000_000 or not _plan_allowed(ctx, kind):
+            await message.reply_text("❌ Send the price in USD, for example <code>5</code> or <code>12.5</code> (send <code>0</code> to remove this plan).")
+            return True
+        ADMIN_WAIT.pop(key, None)
+        await db.update_clone_fields(bot_id, {f"{PLAN_FIELDS[kind]}.{months}": cents})
+        fresh = await db.get_clone(bot_id)
+        await message.reply_text(
+            f"✅ {month_label(int(months))} plan " + (f"saved: <b>{fmt_usd(cents)}</b>" if cents else "removed") + "."
+        )
+        if fresh:
+            text_out, kb = await screen_plans(Ctx(fresh, ctx.lang), kind)
+            await send_ui(client, message.chat.id, text_out, kb)
+        return True
     url = normalize_link(message.text or "")
     if not url:
         await message.reply_text("❌ That does not look like a valid link.\nSend something like <code>https://t.me/yourchannel</code> or <code>@yourchannel</code>.")
@@ -395,26 +424,112 @@ async def run_broadcast(client, bot_id: str, report_chat_id: int, source: Dict[s
         BC_RUNNING.discard(bot_id)
 
 
+# ═════════════════════════ Premium plan + multi-month plan editor ═════════════════════════
+PLAN_FIELDS = {"vp": "vip_plans", "pp": "premium_plans"}
+PLAN_TITLES = {"vp": "VIP MEMBERSHIP PLANS", "pp": "PREMIUM PLANS (for clone owners)"}
+
+
+def _plan_allowed(ctx: Ctx, kind: str) -> bool:
+    """pp = the prices clone owners pay for Premium: only the MASTER store sets them. vp = the VIP plans of one store (needs Premium)."""
+    if kind == "pp":
+        return bool(ctx.clone.get("is_master"))
+    return kind == "vp" and is_premium(ctx.clone)
+
+
+async def screen_plans(ctx: Ctx, kind: str) -> Screen:
+    raw = ctx.clone.get(PLAN_FIELDS[kind])
+    current = dict(plans_from(raw))
+    lines = [f"• <b>{month_label(m)}</b> — {fmt_usd(c)}" for m, c in sorted(current.items())]
+    if kind == "vp" and not lines:
+        lines = [f"• <b>1 Month</b> — {fmt_usd(vip_cfg(ctx.clone)['price_cents'])} <i>(default — set your own below)</i>"]
+    body = "\n".join(lines) if lines else "<i>No plan yet — tap a month below and send its price.</i>"
+    who = "Clone owners buy Premium with their wallet in this master bot." if kind == "pp" else "Your buyers pick one of these plans on the VIP screen."
+    text = (
+        f"🗓 <b>{PLAN_TITLES[kind]}</b>\n{DIVIDER}\n{body}\n\n"
+        f"Tap a month to set its price (✅ = already has a price). Send <code>0</code> as the price to remove a plan.\n"
+        f"<i>{who}</i>"
+    )
+    rows, row = [], []
+    for months in range(1, 13):
+        mark = "✅ " if months in current else ""
+        row.append(B(f"{mark}{months} mo" + (f" · {fmt_usd(current[months])}" if months in current else ""), f"adm:plan:{kind}:{months}", "primary" if months in current else "success"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    rows.append([B("◀️ Back", "adm:premium" if kind == "vp" else "adm:home")])
+    return text, markup(rows)
+
+
+async def screen_prem(ctx: Ctx, user_id: int = 0, note: str = "") -> Screen:
+    """Premium page of a clone owner: status, plans, buy buttons."""
+    clone = ctx.clone
+    master = await db.get_master_clone() or {}
+    plans = plans_from(master.get("premium_plans"))
+    until = int(clone.get("premium_until") or 0)
+    if clone.get("is_master"):
+        text = f"💎 <b>PREMIUM</b>\n{DIVIDER}\n👑 This is the master store — all premium features are always unlocked.\nSet the prices clone owners pay in <b>👑 Premium Plans</b>."
+        return text, markup([[B("👑 Premium Plans", "adm:plans:pp", "primary")], BACK])
+    active = is_premium(clone)
+    balance = await db.get_balance(str(master.get("_id", "")), user_id) if user_id and master else 0
+    status = f"✅ <b>Active</b> until <b>{fmt_date(until)}</b>" if active else "❌ <b>Not active</b>"
+    plan_lines = "\n".join(f"• <b>{month_label(m)}</b> — {fmt_usd(c)}" for m, c in plans) or "<i>Premium plans are not available yet. Please contact the platform owner.</i>"
+    text = (
+        f"💎 <b>PREMIUM</b>\n{DIVIDER}\n"
+        f"{status}\n\n"
+        f"<b>Unlocks</b>\n• 💎 VIP Membership (with your own plans)\n• 🎁 Refer &amp; Earn\n• 🎟 Coupons / Redeem codes\n• 🔒 VIP-only products\n\n"
+        f"<b>Plans</b>\n{plan_lines}\n\n"
+        f"👛 Your wallet in {esc(master.get('bot_username', 'the master bot'))}: <b>{fmt_usd(balance)}</b>\n"
+        f"<i>Pay from that wallet. Low balance? Open the master bot → Top Up, then come back here.</i>"
+    )
+    if note:
+        text = f"{note}\n\n{text}"
+    rows, row = [], []
+    for months, cents in plans:
+        row.append(B(f"💎 {months} mo — {fmt_usd(cents)}", f"adm:prembuy:{months}", "primary"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    username = str(master.get("bot_username", "")).lstrip("@")
+    if username:
+        rows.append([btn("💰 Top Up in master bot", FONT, "success", url=f"https://t.me/{username}")])
+    rows.append(BACK)
+    return text, markup(rows)
+
+
 # ═════════════════════════ Premium features screens ═════════════════════════
 async def screen_premium(ctx: Ctx) -> Screen:
     clone = ctx.clone
+    if not is_premium(clone):
+        text = (
+            f"💎 <b>VIP &amp; REWARDS</b>  🔒\n{DIVIDER}\n"
+            f"These features need a <b>Premium plan</b>:\n• 💎 VIP Membership (your own multi-month plans)\n• 🎁 Refer &amp; Earn\n• 🎟 Coupons\n• 🔒 VIP-only products\n\n"
+            f"Top-up bonus and Broadcast stay free."
+        )
+        return text, markup([[B("💎 Get Premium", "adm:prem", "primary")], BACK])
     vip, ref, tiers = vip_cfg(clone), referral_cfg(clone), topup_tiers(clone)
     coupons = await db.list_coupons(str(clone["_id"]))
     tier_text = " · ".join(f"{fmt_usd(int(t['min_cents']))}+ → {int(t['pct'])}%" for t in tiers) if tiers else "off"
+    plan_text = " · ".join(f"{m}mo {fmt_usd(c)}" for m, c in vip_plans(clone))
+    until = int(clone.get("premium_until") or 0)
+    status = "👑 master — always on" if clone.get("is_master") else f"💎 Premium until {fmt_date(until)}"
     text = (
         f"💎 <b>VIP &amp; REWARDS</b>\n{DIVIDER}\n"
-        f"{ok(vip['enabled'])} <b>VIP membership</b>  {fmt_usd(vip['price_cents'])} / {vip['days']} days · {vip['discount_pct']}% off\n"
+        f"{status}\n\n"
+        f"{ok(vip['enabled'])} <b>VIP membership</b>  {vip['discount_pct']}% off · plans: {plan_text}\n"
         f"{ok(ref['enabled'])} <b>Referral</b>  bonus {fmt_usd(int(ref['bonus_cents']))} per invited friend\n"
         f"{ok(tiers)} <b>Top-up bonus</b>  {tier_text}\n"
         f"🎟 <b>Coupons</b>  {len(coupons)}\n\n"
         f"<b>Change settings</b>\n"
-        f"/setvip <code>PRICE DAYS DISCOUNT%</code> — e.g. <code>/setvip 5 30 15</code>\n"
+        f"/setvip <code>DISCOUNT%</code> — e.g. <code>/setvip 15</code> · /setvipplan <code>MONTHS PRICE</code> — e.g. <code>/setvipplan 3 12</code>\n"
         f"/setreferral <code>BONUS_USD</code> — e.g. <code>/setreferral 0.5</code>\n"
         f"/settopupbonus <code>10:5 25:10 50:15</code> (USD:percent) · <code>off</code> · <code>default</code>\n"
         f"/addcoupon <code>CODE PERCENT [MAX_USES] [DAYS]</code> · /delcoupon <code>CODE</code>\n"
         f"/vipproduct <code>PRODUCT_ID on|off</code> — make a product VIP-only"
     )
     rows = [
+        [B("🗓 VIP Plans (1–12 months)", "adm:plans:vp", "primary")],
         [B("💎 VIP: ON" if vip["enabled"] else "💎 VIP: OFF", f"adm:vipsw:{'off' if vip['enabled'] else 'on'}", "danger" if vip["enabled"] else "success"),
          B("🎁 Referral: ON" if ref["enabled"] else "🎁 Referral: OFF", f"adm:refsw:{'off' if ref['enabled'] else 'on'}", "danger" if ref["enabled"] else "success")],
         [B("🎟 Coupons", "adm:coupons", "primary")],
@@ -424,6 +539,8 @@ async def screen_premium(ctx: Ctx) -> Screen:
 
 
 async def screen_coupons(ctx: Ctx) -> Screen:
+    if not is_premium(ctx.clone):
+        return await screen_premium(ctx)
     coupons = await db.list_coupons(str(ctx.clone["_id"]))
     lines = []
     rows = []
@@ -522,6 +639,52 @@ async def handle_admin_callback(client, query: CallbackQuery, ctx: Ctx, parts: L
             f"Send the link now as a message:\n<code>https://t.me/yourchannel</code>  or  <code>@yourchannel</code>"
         )
         await render(client, ctx, query, prompt, markup([[B("✖️ Cancel", "adm:links", "danger")]]))
+        return
+    elif section in ("vipsw", "refsw", "cdel") and not is_premium(ctx.clone):
+        await query.answer("🔒 Premium required — tap 💎 Get Premium.", show_alert=True)
+        return
+    elif section == "plans" and arg in PLAN_FIELDS:
+        if not _plan_allowed(ctx, arg):
+            await query.answer("🔒 Premium required — tap 💎 Get Premium.", show_alert=True)
+            return
+        await query.answer()
+        await render(client, ctx, query, *await screen_plans(ctx, arg))
+        return
+    elif section == "plan" and arg in PLAN_FIELDS and len(parts) > 3 and parts[3].isdigit() and 1 <= int(parts[3]) <= 12:
+        if not _plan_allowed(ctx, arg):
+            await query.answer("🔒 Premium required — tap 💎 Get Premium.", show_alert=True)
+            return
+        ADMIN_WAIT[(bot_id, user_id)] = f"plan:{arg}:{int(parts[3])}"
+        await query.answer()
+        prompt = (
+            f"✏️ <b>{month_label(int(parts[3]))} plan</b>\n{DIVIDER}\n"
+            f"Send the price in USD now, for example <code>5</code> or <code>12.5</code>.\nSend <code>0</code> to remove this plan."
+        )
+        await render(client, ctx, query, prompt, markup([[B("✖️ Cancel", f"adm:plans:{arg}", "danger")]]))
+        return
+    elif section == "prem":
+        await query.answer()
+        await render(client, ctx, query, *await screen_prem(ctx, user_id))
+        return
+    elif section == "prembuy" and arg.isdigit():
+        if ctx.is_master:
+            await query.answer("The master store already has every feature.", show_alert=True)
+            return
+        result = await purchase_premium(ctx.clone, user_id, int(arg))
+        if result["status"] == "no_balance":
+            await query.answer(
+                f"Not enough balance in the master bot wallet. You need {fmt_usd(result['price'])}, you have {fmt_usd(result['balance'])}. Top up there first.",
+                show_alert=True,
+            )
+            return
+        if result["status"] != "ok":
+            await query.answer("This plan is not available.", show_alert=True)
+            return
+        await query.answer("💎 Premium activated!")
+        fresh = await db.get_clone(bot_id)
+        if fresh:
+            ctx = Ctx(fresh, ctx.lang)
+        await render(client, ctx, query, *await screen_prem(ctx, user_id, f"🎉 <b>Premium activated until {fmt_date(result['until'])}!</b>"))
         return
     elif section == "vipsw" and arg in ("on", "off"):
         await db.update_clone_fields(bot_id, {"vip.enabled": arg == "on"})

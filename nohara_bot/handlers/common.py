@@ -21,6 +21,7 @@ from nohara_bot.services.core import (
     fmt_usd,
     get_ctx,
     get_user_perks,
+    is_premium,
     referral_cfg,
     send_ui,
     topup_tiers,
@@ -132,6 +133,7 @@ async def _status_lines(ctx: Ctx, user_id: int) -> List[str]:
     """The small 'your account' block on the welcome screen: balance, VIP status, bonus and referral hints."""
     clone = ctx.clone
     vip, ref, tiers = vip_cfg(clone), referral_cfg(clone), topup_tiers(clone)
+    premium = is_premium(clone)
     try:
         balance = await db.get_balance(str(clone["_id"]), user_id)
         perks = await get_user_perks(clone, user_id)
@@ -140,11 +142,11 @@ async def _status_lines(ctx: Ctx, user_id: int) -> List[str]:
     lines = [f"👛 {html.escape(ctx.T('balance_label'))}: <b>{fmt_usd(balance)}</b>"]
     if perks["vip_active"]:
         lines.append(f"💎 <b>{html.escape(ctx.TX('vip_member', 'VIP member'))}</b> · {html.escape(ctx.TX('vip_until', 'until'))} {fmt_date(perks['vip_until'])}")
-    elif vip["enabled"]:
+    elif premium and vip["enabled"]:
         lines.append("⭐ " + html.escape(ctx.TX("vip_join_line", "Join VIP and save {pct}% on every product", pct=vip["discount_pct"])))
     if tiers:
         lines.append("🎁 " + html.escape(ctx.TX("bonus_line", "Top up and get up to {pct}% bonus", pct=max(int(t["pct"]) for t in tiers))))
-    if ref["enabled"] and int(ref["bonus_cents"]) > 0:
+    if premium and ref["enabled"] and int(ref["bonus_cents"]) > 0:
         lines.append("🤝 " + html.escape(ctx.TX("ref_line", "Invite friends and earn {amount} each", amount=fmt_usd(int(ref["bonus_cents"])))))
     return lines
 
@@ -154,7 +156,9 @@ async def show_home(
 ) -> None:
     kb = main_menu(
         ctx.T, ctx.font, _is_owner(ctx, user_id), ctx.is_master, ctx.clone.get("links") or {},
-        vip_on=bool(vip_cfg(ctx.clone)["enabled"]), ref_on=bool(referral_cfg(ctx.clone)["enabled"]),
+        vip_on=bool(is_premium(ctx.clone) and vip_cfg(ctx.clone)["enabled"]),
+        ref_on=bool(is_premium(ctx.clone) and referral_cfg(ctx.clone)["enabled"]),
+        coupon_on=is_premium(ctx.clone),
     )
     await show(client, ctx, chat_id, welcome_text(ctx, name, await _status_lines(ctx, user_id)), kb, "start", replace)
 

@@ -14,6 +14,9 @@ from nohara_bot.handlers.owner import (
     cmd_setreferral,
     cmd_settopupbonus,
     cmd_setvip,
+    cmd_setvipplan,
+    cmd_setpremium,
+    cmd_grantpremium,
     cmd_vipproduct,
     cmd_addfolder,
     cmd_delfolder,
@@ -82,6 +85,9 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
     cmd("removemoney", cmd_removemoney)
     cmd("broadcast", cmd_broadcast)
     cmd("setvip", cmd_setvip)
+    cmd("setvipplan", cmd_setvipplan)
+    cmd("setpremium", cmd_setpremium)
+    cmd("grantpremium", cmd_grantpremium)
     cmd("setreferral", cmd_setreferral)
     cmd("settopupbonus", cmd_settopupbonus)
     cmd("addcoupon", cmd_addcoupon)

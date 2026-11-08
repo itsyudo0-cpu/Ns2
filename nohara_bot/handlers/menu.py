@@ -69,13 +69,19 @@ OWNER_COMMANDS: List[Cmd] = [
     ("addmoney", "Add wallet balance to a user"),
     ("removemoney", "Remove wallet balance from a user"),
     ("broadcast", "Send a message to all your users (free)"),
-    ("setvip", "Set VIP price, days and discount"),
+    ("setvip", "Set the VIP discount percent (Premium)"),
+    ("setvipplan", "Add a VIP plan: months and price (Premium)"),
     ("setreferral", "Set the referral bonus"),
     ("settopupbonus", "Set the top-up bonus tiers"),
     ("addcoupon", "Create a discount coupon"),
     ("delcoupon", "Delete a coupon"),
     ("coupons", "List your coupons"),
     ("vipproduct", "Make a product VIP-only"),
+]
+
+MASTER_OWNER_COMMANDS: List[Cmd] = [
+    ("setpremium", "Set Premium price per months (clone owners)"),
+    ("grantpremium", "Gift Premium months to a clone bot"),
 ]
 
 _OWNER_MENU_DONE: set = set()
@@ -94,7 +100,7 @@ async def _set(token: str, commands: Iterable[Cmd], scope: dict, language_code: 
 
 async def set_owner_menu(client, owner_id: int, is_master: bool = False) -> bool:
     """User + admin commands, shown only inside the owner's own chat with the bot."""
-    commands = USER_COMMANDS + OWNER_COMMANDS + (PLATFORM_COMMANDS if is_master else [])
+    commands = USER_COMMANDS + OWNER_COMMANDS + ((PLATFORM_COMMANDS + MASTER_OWNER_COMMANDS) if is_master else [])
     try:
         await _set(client.nohara_token, commands, {"type": "chat", "chat_id": int(owner_id)})
         return True

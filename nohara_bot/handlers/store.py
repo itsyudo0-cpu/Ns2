@@ -52,6 +52,7 @@ from nohara_bot.services.core import (
     fulfill_paid_order,
     get_ctx,
     get_user_perks,
+    is_premium,
     parse_usd_to_cents,
     price_for,
     referral_cfg,
@@ -61,6 +62,7 @@ from nohara_bot.services.core import (
     topup_bonus_cents,
     topup_tiers,
     vip_cfg,
+    vip_plans,
 )
 
 
@@ -86,7 +88,7 @@ async def store_start(client: Client, message: Message) -> None:
     if not ctx:
         return
     is_new = await db.touch_user(bot_id, user_id)
-    if is_new and referral_cfg(ctx.clone)["enabled"]:
+    if is_new and is_premium(ctx.clone) and referral_cfg(ctx.clone)["enabled"]:
         args = message.command[1:] if getattr(message, "command", None) else []
         if args and args[0].startswith("ref_") and args[0][4:].isdigit():
             referrer_id = int(args[0][4:])
@@ -199,8 +201,8 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
             await _show_products(client, ctx, chat_id, msg, parts[1])
             return
 
-        if action == "vip" and parts[1:] == ["buy"]:
-            await _handle_vip_buy(client, query, ctx)
+        if action == "vip" and len(parts) == 3 and parts[1] == "buy" and parts[2].isdigit():
+            await _handle_vip_buy(client, query, ctx, int(parts[2]))
             return
 
         if action == "top" and len(parts) >= 3:
@@ -253,17 +255,17 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
         await query.answer()
         await _show_topup_methods(client, ctx, chat_id, query.from_user.id, msg)
 
-    elif target == "vip":
+    elif target in ("vip", "ref", "coupon"):
+        if not is_premium(ctx.clone):  # stale button from before the feature was locked
+            await query.answer(ctx.TX("feature_off", "This feature is not available right now."), show_alert=True)
+            return
         await query.answer()
-        await _show_vip(client, ctx, chat_id, user_id, msg)
-
-    elif target == "ref":
-        await query.answer()
-        await _show_referral(client, ctx, chat_id, user_id, msg)
-
-    elif target == "coupon":
-        await query.answer()
-        await _prompt_coupon(client, ctx, chat_id, user_id, msg)
+        if target == "vip":
+            await _show_vip(client, ctx, chat_id, user_id, msg)
+        elif target == "ref":
+            await _show_referral(client, ctx, chat_id, user_id, msg)
+        else:
+            await _prompt_coupon(client, ctx, chat_id, user_id, msg)
 
     elif target == "lang":
         await query.answer()
@@ -290,18 +292,18 @@ async def _handle_menu(client: Client, query: CallbackQuery, ctx: Ctx, target: s
 # ═════════════════════════════════════════════════════════════════════
 async def _show_vip(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg, note: str = "") -> None:
     cfg = vip_cfg(ctx.clone)
-    if not cfg["enabled"]:
+    if not cfg["enabled"] or not is_premium(ctx.clone):
         await show(client, ctx, chat_id, f"💎 {ctx.H('VIP')}\n{DIVIDER}\n{html.escape(ctx.TX('feature_off', 'This feature is not available right now.'))}",
                    back_keyboard(ctx.T, ctx.font), "wallet", msg)
         return
     perks = await get_user_perks(ctx.clone, user_id)
     balance = await db.get_balance(str(ctx.clone["_id"]), user_id)
+    plans = vip_plans(ctx.clone)
     if perks["vip_active"]:
         status = f"✅ <b>{html.escape(ctx.TX('vip_active', 'Active'))}</b> · {html.escape(ctx.TX('vip_until', 'until'))} <b>{fmt_date(perks['vip_until'])}</b>"
-        buy_label = ctx.TX("vip_extend", "Extend VIP — {price} / {days} days", price=fmt_usd(cfg["price_cents"]), days=cfg["days"])
     else:
         status = f"❌ {html.escape(ctx.TX('vip_inactive', 'Not a member yet'))}"
-        buy_label = ctx.TX("vip_join", "Join VIP — {price} / {days} days", price=fmt_usd(cfg["price_cents"]), days=cfg["days"])
+    plan_lines = "\n".join(f"• <b>{m} Month{'' if m == 1 else 's'}</b> — {fmt_usd(c)}" for m, c in plans)
     text = (
         f"💎 {ctx.H(ctx.TX('vip_title', 'VIP Membership'))}\n{DIVIDER}\n"
         f"{html.escape(ctx.TX('vip_status', 'Status'))}: {status}\n\n"
@@ -309,38 +311,39 @@ async def _show_vip(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg, n
         f"• 🏷 {html.escape(ctx.TX('vip_b1', '{pct}% off every product', pct=cfg['discount_pct']))}\n"
         f"• 🔓 {html.escape(ctx.TX('vip_b2', 'Access to VIP-only products'))}\n"
         f"• ⚡ {html.escape(ctx.TX('vip_b3', 'Instant delivery, always'))}\n\n"
-        f"💵 {html.escape(ctx.TX('vip_price', 'Price'))}: <b>{fmt_usd(cfg['price_cents'])}</b> / {cfg['days']} {html.escape(ctx.TX('days', 'days'))}\n"
+        f"💵 <b>{html.escape(ctx.TX('vip_plans', 'Choose a plan'))}</b>\n{plan_lines}\n\n"
         f"👛 {html.escape(ctx.T('balance_label'))}: <b>{fmt_usd(balance)}</b>"
     )
     if note:
         text = f"{note}\n\n{text}"
-    await show(client, ctx, chat_id, text, vip_keyboard(ctx.T, ctx.font, buy_label), "wallet", msg)
+    await show(client, ctx, chat_id, text, vip_keyboard(ctx.T, ctx.font, plans, fmt_usd), "wallet", msg)
 
 
-async def _handle_vip_buy(client: Client, query: CallbackQuery, ctx: Ctx) -> None:
+async def _handle_vip_buy(client: Client, query: CallbackQuery, ctx: Ctx, months: int) -> None:
     bot_id = client.nohara_bot_id
     user_id = query.from_user.id
     msg = query.message
     chat_id = msg.chat.id if msg else user_id
     cfg = vip_cfg(ctx.clone)
-    if not cfg["enabled"]:
+    price = dict(vip_plans(ctx.clone)).get(months)
+    if not cfg["enabled"] or not is_premium(ctx.clone) or not price:
         await query.answer(ctx.TX("feature_off", "This feature is not available right now."), show_alert=True)
         return
-    if not await db.debit(bot_id, user_id, int(cfg["price_cents"])):
+    if not await db.debit(bot_id, user_id, int(price)):
         await query.answer(ctx.T("insufficient_balance"), show_alert=True)
         return
-    until = await db.extend_vip(bot_id, user_id, int(cfg["days"]))
+    until = await db.extend_vip(bot_id, user_id, months * 30)
     await query.answer("💎 VIP activated!")
     await send_audit(
         ctx.clone,
-        f"<b>[NOHARA AUDIT — VIP PURCHASE]</b>\n• User: <code>{user_id}</code> | Paid: <b>{fmt_usd(cfg['price_cents'])}</b> (wallet) | Until: {fmt_date(until)}",
+        f"<b>[NOHARA AUDIT — VIP PURCHASE]</b>\n• User: <code>{user_id}</code> | Plan: {months} month(s) | Paid: <b>{fmt_usd(price)}</b> (wallet) | Until: {fmt_date(until)}",
     )
     await _show_vip(client, ctx, chat_id, user_id, msg, note="🎉 <b>VIP activated — enjoy your benefits!</b>")
 
 
 async def _show_referral(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg) -> None:
     cfg = referral_cfg(ctx.clone)
-    if not cfg["enabled"]:
+    if not cfg["enabled"] or not is_premium(ctx.clone):
         await show(client, ctx, chat_id, f"🎁 {ctx.H('Refer & Earn')}\n{DIVIDER}\n{html.escape(ctx.TX('feature_off', 'This feature is not available right now.'))}",
                    back_keyboard(ctx.T, ctx.font), "wallet", msg)
         return
@@ -396,7 +399,7 @@ async def _handle_coupon_input(client: Client, message: Message, ctx: Ctx) -> No
 
 async def _vip_gate(client: Client, ctx: Ctx, chat_id: int, user_id: int, product: dict, msg, back_cb: str) -> bool:
     """True when the product is VIP-only and this user may not open it (the lock screen is shown)."""
-    if not product.get("vip_only") or _is_owner(ctx, user_id):
+    if not product.get("vip_only") or _is_owner(ctx, user_id) or not is_premium(ctx.clone):
         return False
     perks = await get_user_perks(ctx.clone, user_id)
     if perks["vip_active"]:
@@ -666,7 +669,7 @@ async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: st
         return
 
     perks = await get_user_perks(ctx.clone, user_id)
-    if product.get("vip_only") and not perks["vip_active"] and not _is_owner(ctx, user_id):
+    if product.get("vip_only") and is_premium(ctx.clone) and not perks["vip_active"] and not _is_owner(ctx, user_id):
         await query.answer(ctx.TX("vip_only_alert", "VIP-only product. Join VIP to unlock it."), show_alert=True)
         return
     # VIP / coupon discount: from here on `product["price_cents"]` is the price this user really pays
