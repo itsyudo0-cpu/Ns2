@@ -28,6 +28,7 @@ from nohara_bot.services.core import (
     month_label,
     parse_usd_to_cents,
     plans_from,
+    product_link,
     purchase_premium,
     referral_cfg,
     send_ui,
@@ -96,6 +97,7 @@ ADMIN_GUIDE = (
     "<b>VIP &amp; rewards</b>\n"
     "🔒 Premium: /setvip <code>DISCOUNT%</code> · /setvipplan <code>MONTHS PRICE</code> · /setreferral <code>BONUS_USD</code>\n"
     "/settopupbonus <code>10:5 25:10</code> (free for all)\n"
+    "🔒 /productlink <code>[PRODUCT_ID]</code> — direct buy-page link of a product (Premium)\n"
     "/addcoupon <code>CODE PERCENT [MAX_USES] [DAYS]</code> · /delcoupon <code>CODE</code> · /coupons · /vipproduct <code>ID on|off</code>\n\n"
     "<b>Premium plan (platform owner only)</b>\n"
     "/setpremium <code>MONTHS PRICE</code> · /grantpremium <code>BOT_ID MONTHS</code>\n\n"
@@ -158,14 +160,17 @@ async def screen_products(ctx: Ctx) -> Screen:
     for p in products[:10]:
         stock = "∞" if p["stock"] == -1 else p["stock"]
         where = f" · 🗂 {esc(folders[p['folder']])}" if p.get("folder") in folders else ""
-        lines.append(f"• <b>{esc(p['title'])}</b> — {fmt_usd(p['price_cents'])} · stock {stock}{where}\n   <code>{p['_id']}</code>")
+        link = product_link(ctx.clone, p["_id"]) if is_premium(ctx.clone) else ""
+        link_line = f"\n   🔗 <code>{esc(link)}</code>" if link else ""
+        lines.append(f"• <b>{esc(p['title'])}</b> — {fmt_usd(p['price_cents'])} · stock {stock}{where}\n   <code>{p['_id']}</code>{link_line}")
         rows.append([B(f"🗑 Delete: {p['title'][:28]}", f"adm:pdel:{p['_id']}", "danger")])
     body = "\n".join(lines) if lines else "<i>No products yet.</i>"
     more = f"\n<i>…and {len(products) - 10} more (see /products)</i>" if len(products) > 10 else ""
     text = (
         f"📦 <b>PRODUCTS</b>  ·  {len(products)}\n{DIVIDER}\n{body}{more}\n\n"
         f"➕ <b>Add a product</b>\nSend a file with the caption:\n<code>/addproduct Title | 9.99 | 10 | Folder</code>\n"
-        f"<i>Price in USD · stock and folder are optional</i>"
+        f"<i>Price in USD · stock and folder are optional</i>\n"
+        + ("🔗 <i>Each product shows its direct buy link — share it anywhere.</i>" if is_premium(ctx.clone) else "🔒 <i>Direct product links: Premium feature (💎 Get Premium)</i>")
     )
     rows.append(BACK)
     return text, markup(rows)
@@ -476,7 +481,7 @@ async def screen_prem(ctx: Ctx, user_id: int = 0, note: str = "") -> Screen:
     text = (
         f"💎 <b>PREMIUM</b>\n{DIVIDER}\n"
         f"{status}\n\n"
-        f"<b>Unlocks</b>\n• 💎 VIP Membership (with your own plans)\n• 🎁 Refer &amp; Earn\n• 🎟 Coupons / Redeem codes\n• 🔒 VIP-only products\n\n"
+        f"<b>Unlocks</b>\n• 💎 VIP Membership (with your own plans)\n• 🎁 Refer &amp; Earn\n• 🎟 Coupons / Redeem codes\n• 🔒 VIP-only products\n• 🔗 Direct product links\n\n"
         f"<b>Plans</b>\n{plan_lines}\n\n"
         f"👛 Your wallet in {esc(master.get('bot_username', 'the master bot'))}: <b>{fmt_usd(balance)}</b>\n"
         f"<i>Pay from that wallet. Low balance? Open the master bot → Top Up, then come back here.</i>"
@@ -504,7 +509,7 @@ async def screen_premium(ctx: Ctx) -> Screen:
     if not is_premium(clone):
         text = (
             f"💎 <b>VIP &amp; REWARDS</b>  🔒\n{DIVIDER}\n"
-            f"These features need a <b>Premium plan</b>:\n• 💎 VIP Membership (your own multi-month plans)\n• 🎁 Refer &amp; Earn\n• 🎟 Coupons\n• 🔒 VIP-only products\n\n"
+            f"These features need a <b>Premium plan</b>:\n• 💎 VIP Membership (your own multi-month plans)\n• 🎁 Refer &amp; Earn\n• 🎟 Coupons\n• 🔒 VIP-only products\n• 🔗 Direct product links\n\n"
             f"Top-up bonus and Broadcast stay free."
         )
         return text, markup([[B("💎 Get Premium", "adm:prem", "primary")], BACK])

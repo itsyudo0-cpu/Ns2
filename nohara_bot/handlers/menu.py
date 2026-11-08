@@ -71,6 +71,7 @@ OWNER_COMMANDS: List[Cmd] = [
     ("broadcast", "Send a message to all your users (free)"),
     ("setvip", "Set the VIP discount percent (Premium)"),
     ("setvipplan", "Add a VIP plan: months and price (Premium)"),
+    ("productlink", "Get direct buy links of your products (Premium)"),
     ("setreferral", "Set the referral bonus"),
     ("settopupbonus", "Set the top-up bonus tiers"),
     ("addcoupon", "Create a discount coupon"),

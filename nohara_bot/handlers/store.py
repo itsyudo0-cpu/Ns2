@@ -98,6 +98,14 @@ async def store_start(client: Client, message: Message) -> None:
         spawn(ensure_owner_menu(client, bot_id, user_id, ctx.is_master))
     if not await ensure_fsub(client, ctx, message.chat.id, user_id):
         return
+    # Direct product link  t.me/<bot>?start=p_<product id>  → the buy page itself (Premium feature of a clone)
+    args = message.command[1:] if getattr(message, "command", None) else []
+    if args and args[0].startswith("p_") and is_premium(ctx.clone):
+        product = await db.get_product(bot_id, args[0][2:])
+        if product:
+            await _render_product(client, ctx, message.chat.id, user_id, product, None, back_cb="menu:home")
+            return
+        await message.reply_text("⚠️ " + html.escape(ctx.TX("product_gone", "This product is no longer available.")))
     await show_home(client, ctx, message.chat.id, user_id, name=message.from_user.first_name or "")
 
 
@@ -610,13 +618,22 @@ async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, produc
         await query.answer(ctx.T("something_wrong"), show_alert=True)
         return
     await query.answer()
+    await _render_product(client, ctx, chat_id, query.from_user.id, product, msg)
 
+
+async def _render_product(
+    client: Client, ctx: Ctx, chat_id: int, user_id: int, product: dict, msg, back_cb: Optional[str] = None
+) -> None:
+    """The product buy page. Used by the product button AND by direct product links (back_cb = menu:home)."""
+    product_id = product["_id"]
     known = {f["id"] for f in ctx.clone.get("folders") or []}
-    if known:
+    if back_cb:
+        lock_back = back_cb
+    elif known:
         lock_back = f"fold:{product['folder']}" if product.get("folder") in known else "fold:_"
     else:
         lock_back = "menu:products"
-    if await _vip_gate(client, ctx, chat_id, query.from_user.id, product, msg, lock_back):
+    if await _vip_gate(client, ctx, chat_id, user_id, product, msg, lock_back):
         return
 
     gateways = ctx.clone["gateways"]
@@ -624,8 +641,8 @@ async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, produc
     fampay_on = bool(gateways["fampay"]["enabled"] and gateways["fampay"]["upi_id"])
     in_stock = product["stock"] != 0
 
-    perks = await get_user_perks(ctx.clone, query.from_user.id)
-    final_cents, info = await price_for(ctx.clone, perks, query.from_user.id, product)
+    perks = await get_user_perks(ctx.clone, user_id)
+    final_cents, info = await price_for(ctx.clone, perks, user_id, product)
     if info["pct"]:
         tag = "💎 VIP" if info["source"] == "vip" else f"🎟 {html.escape(info['code'])}"
         price = f"<s>{fmt_usd(info['list_cents'])}</s> → <b>{fmt_usd(final_cents)}</b>  ({tag} −{info['pct']}%)"
@@ -645,12 +662,7 @@ async def _handle_product(client: Client, query: CallbackQuery, ctx: Ctx, produc
     if not in_stock:
         text += f"\n\n{html.escape(ctx.T('out_of_stock_msg'))}"
 
-    known = {f["id"] for f in ctx.clone.get("folders") or []}
-    if known:
-        back_cb = f"fold:{product['folder']}" if product.get("folder") in known else "fold:_"
-    else:
-        back_cb = "menu:products"
-    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, back_cb)
+    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, lock_back)
     await show(client, ctx, chat_id, text, kb, "product" if in_stock else "stock", msg)
 
 

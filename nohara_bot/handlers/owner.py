@@ -33,6 +33,7 @@ from nohara_bot.services.core import (
     is_premium,
     month_label,
     parse_usd_to_cents,
+    product_link,
     send_audit,
 )
 
@@ -356,6 +357,7 @@ async def cmd_addproduct(client: Client, message: Message, ctx: Ctx) -> None:
         f"• Stock: {'unlimited' if stock == -1 else stock}\n"
         + (f"• Folder: {html.escape(parts[3])}\n" if folder_id else "")
         + f"• ID: <code>{product_id}</code>"
+        + _link_line(ctx, product_id)
     )
     await send_audit(
         ctx.clone,
@@ -652,13 +654,44 @@ async def cmd_vipproduct(client: Client, message: Message, ctx: Ctx) -> None:
 
 
 async def _premium_gate(message: Message, ctx: Ctx) -> bool:
-    """True (and a message is sent) when this store has no Premium: VIP / referral / coupons are Premium features."""
+    """True (and a message is sent) when this store has no Premium: VIP / referral / coupons / product links are Premium features."""
     if is_premium(ctx.clone):
         return False
     await message.reply_text(
-        "🔒 <b>Premium required.</b>\nVIP Membership, Refer &amp; Earn and Coupons are Premium features.\nOpen /admin → <b>💎 Get Premium</b>."
+        "🔒 <b>Premium required.</b>\nVIP Membership, Refer &amp; Earn, Coupons and Direct product links are Premium features.\nOpen /admin → <b>💎 Get Premium</b>."
     )
     return True
+
+
+def _link_line(ctx: Ctx, product_id: str) -> str:
+    """The 'direct link' line shown under a product (Premium)."""
+    if not is_premium(ctx.clone):
+        return "\n🔒 <i>Direct product link: Premium feature (/admin → 💎 Get Premium)</i>"
+    link = product_link(ctx.clone, product_id)
+    return f"\n🔗 <b>Direct link</b> (opens this product's buy page):\n<code>{html.escape(link)}</code>" if link else ""
+
+
+@owner_only
+async def cmd_productlink(client: Client, message: Message, ctx: Ctx) -> None:
+    """/productlink [PRODUCT_ID] — direct buy-page link of one product, or of all products."""
+    if await _premium_gate(message, ctx):
+        return
+    args = _args(message)
+    bot_id = client.nohara_bot_id
+    if args:
+        product = await db.get_product(bot_id, args[0])
+        if not product:
+            await message.reply_text("❌ Product not found. Check the ID with /products.")
+            return
+        await message.reply_text(f"🔗 <b>{html.escape(product['title'])}</b>{_link_line(ctx, product['_id'])}")
+        return
+    products = await db.list_products(bot_id)
+    if not products:
+        await message.reply_text("No products yet. Use <code>/addproduct</code>.")
+        return
+    lines = [f"• <b>{html.escape(p['title'])}</b>\n<code>{html.escape(product_link(ctx.clone, p['_id']))}</code>" for p in products[:25]]
+    more = f"\n<i>…and {len(products) - 25} more — use /productlink PRODUCT_ID</i>" if len(products) > 25 else ""
+    await message.reply_text("🔗 <b>Direct product links</b>\n<i>Open the buy page directly — no menu, no folders.</i>\n\n" + "\n".join(lines) + more)
 
 
 async def _save_plan(message: Message, field: str, args: list, bot_id: str, usage: str) -> None:
