@@ -11,12 +11,12 @@ from hydrogram.handlers import MessageHandler
 from hydrogram.types import Message
 from typing import Any, Dict
 
-from nohara_bot.config import MASTER_AUDIT_CHANNEL_ID, MAX_CLONES_PER_USER, MAX_CLONES_TOTAL
+from nohara_bot.config import FREE_CLONES_PER_USER, MASTER_AUDIT_CHANNEL_ID, MAX_CLONES_TOTAL, PREMIUM_CLONES_PER_USER
 from nohara_bot.database import db
 from nohara_bot.handlers.common import _args, _is_admin
 from nohara_bot.handlers.menu import apply_command_menu
 from nohara_bot.handlers.registry import register_store_handlers
-from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, make_client
+from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, is_premium, make_client
 
 
 log = logging.getLogger("nohara.handlers.master")
@@ -97,10 +97,20 @@ async def master_clone(client: Client, message: Message) -> None:
         return
     if not existing:
         owned = await db.get_clones_by_owner(owner_id)
-        if len(owned) >= MAX_CLONES_PER_USER and not _is_admin(owner_id):
-            await say(f"❌ You can create at most {MAX_CLONES_PER_USER} bots.")
-            return
-        if await db.count_clones() >= MAX_CLONES_TOTAL:
+        if not _is_admin(owner_id):
+            # A user counts as Premium if ANY of their bots has an active Premium plan.
+            user_premium = any(is_premium(c) for c in owned)
+            limit = PREMIUM_CLONES_PER_USER if user_premium else FREE_CLONES_PER_USER
+            if len(owned) >= limit:
+                if user_premium:
+                    await say(f"❌ You have reached the Premium limit of {limit} bots.")
+                else:
+                    await say(
+                        f"❌ Free users can create only {limit} bot.\n"
+                        f"💎 Buy Premium on your bot to create up to {PREMIUM_CLONES_PER_USER} bots."
+                    )
+                return
+        if MAX_CLONES_TOTAL > 0 and await db.count_clones() >= MAX_CLONES_TOTAL:
             await say("❌ The platform has reached its bot limit. Please try again later.")
             return
 

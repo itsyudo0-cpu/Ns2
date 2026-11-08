@@ -101,6 +101,6 @@ def register_store_handlers(client: Client, bot_id: str) -> None:
     client.add_handler(
         MessageHandler(
             store_user_message,
-            private & (filters.text | filters.photo | filters.document) & ~filters.regex(r"^/"),
+            private & (filters.text | filters.photo | filters.document | filters.video | filters.audio) & ~filters.regex(r"^/"),
         )
     )

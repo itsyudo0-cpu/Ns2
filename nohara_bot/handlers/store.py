@@ -4,6 +4,7 @@ NOHARA STORE BOT — Store bot — public handlers: /start, language, menus, pro
 """
 
 import html
+import time
 import logging
 from decimal import Decimal
 from hydrogram import Client
@@ -25,6 +26,7 @@ from nohara_bot.buttons import (
     topup_methods_keyboard,
     referral_keyboard,
     upi_review_keyboard,
+    vip_confirm_keyboard,
     vip_keyboard,
     vip_locked_keyboard,
     wallet_keyboard,
@@ -40,7 +42,7 @@ from nohara_bot.handlers.common import (
     show,
     show_home,
 )
-from nohara_bot.handlers.admin import ADMIN_WAIT, handle_admin_callback, handle_link_input, screen_home
+from nohara_bot.handlers.admin import ADMIN_WAIT, handle_admin_callback, handle_link_input, handle_product_input, screen_home
 from nohara_bot.i18n import SUPPORTED_LANG_CODES
 from nohara_bot.payments import create_oxapay_invoice
 from nohara_bot.services.core import (
@@ -213,6 +215,10 @@ async def store_callback(client: Client, query: CallbackQuery) -> None:
             await _handle_vip_buy(client, query, ctx, int(parts[2]))
             return
 
+        if action == "vip" and len(parts) == 3 and parts[1] == "ok" and parts[2].isdigit():
+            await _handle_vip_confirm(client, query, ctx, int(parts[2]))
+            return
+
         if action == "top" and len(parts) >= 3:
             await _handle_topup(client, query, ctx, parts)
             return
@@ -328,6 +334,42 @@ async def _show_vip(client: Client, ctx: Ctx, chat_id: int, user_id: int, msg, n
 
 
 async def _handle_vip_buy(client: Client, query: CallbackQuery, ctx: Ctx, months: int) -> None:
+    """Step 1 — the buyer tapped a plan: show what it includes. NOTHING is charged here."""
+    user_id = query.from_user.id
+    msg = query.message
+    chat_id = msg.chat.id if msg else user_id
+    cfg = vip_cfg(ctx.clone)
+    price = dict(vip_plans(ctx.clone)).get(months)
+    if not cfg["enabled"] or not is_premium(ctx.clone) or not price:
+        await query.answer(ctx.TX("feature_off", "This feature is not available right now."), show_alert=True)
+        return
+    await query.answer()
+    perks = await get_user_perks(ctx.clone, user_id)
+    balance = await db.get_balance(str(ctx.clone["_id"]), user_id)
+    base = max(int(time.time()), int(perks["vip_until"] or 0)) if perks["vip_active"] else int(time.time())
+    new_until = base + months * 30 * 86400
+    can_pay = balance >= int(price)
+    label = f"{months} Month{'' if months == 1 else 's'}"
+    per_month = f"  <i>(≈ {fmt_usd(int(price) // months)}/month)</i>" if months > 1 else ""
+    text = (
+        f"💎 {ctx.H('Confirm VIP')}\n{DIVIDER}\n"
+        f"🗓 Plan: <b>{label}</b>\n"
+        f"💵 Price: <b>{fmt_usd(int(price))}</b>{per_month}\n"
+        f"⏳ {'Extends VIP until' if perks['vip_active'] else 'VIP active until'}: <b>{fmt_date(new_until)}</b>\n"
+        f"👛 {html.escape(ctx.T('balance_label'))}: <b>{fmt_usd(balance)}</b>"
+        + (f"  →  after payment <b>{fmt_usd(balance - int(price))}</b>" if can_pay else "") + "\n\n"
+        f"<b>✨ With {label} of VIP you get</b>\n"
+        f"• 🏷 <b>{cfg['discount_pct']}% off</b> every product\n"
+        f"• 🔓 Access to <b>VIP-only products</b>\n"
+        f"• ⚡ Instant delivery, always\n\n"
+        + ("⚠️ <b>Your wallet is charged only when you tap “Confirm &amp; Pay”.</b>" if can_pay
+           else f"❌ <b>Not enough balance</b> — you need {fmt_usd(int(price) - balance)} more. Top up first.")
+    )
+    await show(client, ctx, chat_id, text, vip_confirm_keyboard(ctx.T, ctx.font, months, can_pay), "wallet", msg)
+
+
+async def _handle_vip_confirm(client: Client, query: CallbackQuery, ctx: Ctx, months: int) -> None:
+    """Step 2 — the buyer tapped ✅ Confirm & Pay: now the wallet is charged and VIP is activated."""
     bot_id = client.nohara_bot_id
     user_id = query.from_user.id
     msg = query.message
@@ -577,7 +619,7 @@ async def _show_products(client: Client, ctx: Ctx, chat_id: int, msg, folder_id)
     bot_id = str(ctx.clone["_id"])
     folders = ctx.clone.get("folders") or []
     known = {f["id"]: f["name"] for f in folders}
-    everything = await db.list_products(bot_id)
+    everything = await db.list_products(bot_id, only_active=True)
     title = f"🛍 {ctx.H(ctx.T('collection_title'))}"
 
     if folder_id is None and folders:
@@ -626,6 +668,11 @@ async def _render_product(
 ) -> None:
     """The product buy page. Used by the product button AND by direct product links (back_cb = menu:home)."""
     product_id = product["_id"]
+    if product.get("active", True) is False and not _is_owner(ctx, user_id):
+        await show(client, ctx, chat_id,
+                   f"⚠️ {html.escape(ctx.TX('product_gone', 'This product is no longer available.'))}",
+                   back_keyboard(ctx.T, ctx.font), "catalog", msg)
+        return
     known = {f["id"] for f in ctx.clone.get("folders") or []}
     if back_cb:
         lock_back = back_cb
@@ -659,10 +706,15 @@ async def _render_product(
         f"📦 {html.escape(ctx.T('stock_label'))}: <b>{html.escape(stock_text)}</b>\n"
         f"⚡ {html.escape(ctx.T('instant_delivery_line'))}"
     )
+    description = (product.get("description") or "").strip()
+    if description:
+        text += f"\n\n📝 {html.escape(description[:800])}"
+    if product.get("active", True) is False:
+        text += "\n\n🔴 <i>Inactive — hidden from buyers (only you can see this page).</i>"
     if not in_stock:
         text += f"\n\n{html.escape(ctx.T('out_of_stock_msg'))}"
 
-    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, lock_back)
+    kb = product_keyboard(product_id, ctx.T, ctx.font, in_stock, oxapay_on, fampay_on, lock_back, product.get("demo_url") or "")
     await show(client, ctx, chat_id, text, kb, "product" if in_stock else "stock", msg)
 
 
@@ -675,6 +727,9 @@ async def _handle_pay(client: Client, query: CallbackQuery, ctx: Ctx, method: st
     product = await db.get_product(bot_id, product_id)
     if not product:
         await query.answer(ctx.T("something_wrong"), show_alert=True)
+        return
+    if product.get("active", True) is False and not _is_owner(ctx, user_id):
+        await query.answer(ctx.TX("product_gone", "This product is no longer available."), show_alert=True)
         return
     if product["stock"] == 0:
         await query.answer(ctx.T("out_of_stock_msg"), show_alert=True)
@@ -797,6 +852,9 @@ async def store_user_message(client: Client, message: Message) -> None:
     user_id = message.from_user.id
     ctx = await get_ctx(bot_id, user_id)
     if not ctx:
+        return
+
+    if await handle_product_input(client, message, ctx):  # owner is adding / editing a product (file, title, price …)
         return
 
     if message.text:
