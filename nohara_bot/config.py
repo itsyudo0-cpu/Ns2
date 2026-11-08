@@ -46,7 +46,7 @@ MY_VALUES = {
     "DEFAULT_FONT_STYLE": "default_html",
     "DEFAULT_USD_TO_INR": "88.0",
     "FREE_CLONES_PER_USER": "1",      # हर यूज़र (फ्री) कितने बॉट क्लोन कर सकता है
-    "PREMIUM_CLONES_PER_USER": "5",   # Premium वाले यूज़र के लिए लिमिट
+    "PREMIUM_CLONES_PER_USER": "3",   # Premium वाले यूज़र के लिए लिमिट
     "MAX_CLONES_TOTAL": "0",          # पूरे प्लेटफ़ॉर्म पर कुल बॉट: 0 = अनलिमिटेड
     "BUTTON_COLORS": "true",
     "OXAPAY_SANDBOX": "false",  # टेस्ट के लिए "true", असली पेमेंट के लिए "false"
@@ -162,7 +162,7 @@ DEFAULT_USD_TO_INR = float(_env("DEFAULT_USD_TO_INR", "88.0") or 88.0)
 # Free Render instances have little RAM, so keep the number of running clones limited.
 # Per-user limits: 1 bot for free users, 5 for users who hold a Premium plan on any of their bots.
 FREE_CLONES_PER_USER = _optional_int("FREE_CLONES_PER_USER", 1)
-PREMIUM_CLONES_PER_USER = _optional_int("PREMIUM_CLONES_PER_USER", 5)
+PREMIUM_CLONES_PER_USER = _optional_int("PREMIUM_CLONES_PER_USER", 3)
 # Platform-wide cap. 0 (default) = unlimited.
 MAX_CLONES_TOTAL = _optional_int("MAX_CLONES_TOTAL", 0)
 
