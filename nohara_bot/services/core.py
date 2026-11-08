@@ -323,6 +323,12 @@ def vip_plans(clone: Dict[str, Any]) -> List[Any]:
     return plans_from(clone.get("vip_plans")) or [(1, int(vip_cfg(clone)["price_cents"]))]
 
 
+def product_link(clone: Dict[str, Any], product_id: str) -> str:
+    """Direct link to ONE product's buy page (no folders, no menu). '' when the bot username is unknown."""
+    username = str(clone.get("bot_username") or "").lstrip("@")
+    return f"https://t.me/{username}?start=p_{product_id}" if username else ""
+
+
 async def get_master_clone() -> Optional[Dict[str, Any]]:
     return await db.get_master_clone()
 
