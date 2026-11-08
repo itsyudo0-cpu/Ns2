@@ -106,6 +106,17 @@ def vip_keyboard(T: Callable[..., str], font: str, plans: List[Any], price_fmt: 
     return _markup(rows)
 
 
+def vip_confirm_keyboard(T: Callable[..., str], font: str, months: int, can_pay: bool) -> Markup:
+    """Step 2 of buying VIP: nothing is charged until the buyer taps Confirm."""
+    rows: List[List[Button]] = []
+    if can_pay:
+        rows.append([_btn("✅ " + _t(T, "btn_confirm", "Confirm & Pay"), font, "success", f"vip:ok:{months}")])
+    else:
+        rows.append([_btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "primary", "menu:topup")])
+    rows.append([_btn("✖️ " + _t(T, "btn_cancel", "Cancel"), font, "danger", "menu:vip")])
+    return _markup(rows)
+
+
 def vip_locked_keyboard(T: Callable[..., str], font: str, back_cb: str = "menu:products") -> Markup:
     return _markup([
         [_btn("💎 " + _t(T, "btn_vip_get", "Get VIP Access"), font, "primary", "menu:vip")],
@@ -154,6 +165,7 @@ def product_keyboard(
     oxapay_enabled: bool,
     fampay_enabled: bool,
     back_cb: str = "menu:products",
+    demo_url: str = "",
 ) -> Markup:
     if not in_stock:
         return _markup([
@@ -172,6 +184,8 @@ def product_keyboard(
         _btn("◀️ " + T("btn_back"), font, "success", back_cb),
         _btn("✖️ " + T("btn_cancel_order"), font, "danger", "menu:home"),
     ])
+    if demo_url:  # the Demo button sits at the very bottom, under Buy / Back
+        rows.append([_btn("🎬 " + _t(T, "btn_demo", "Demo / Preview"), font, "primary", url=demo_url)])
     return _markup(rows)
 
 

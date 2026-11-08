@@ -275,7 +275,10 @@ class NoharaDatabase:
         await self.users.update_one({"bot_id": str(bot_id), "user_id": int(user_id)}, {"$unset": {"coupon": ""}})
 
     # ───────────────────────── Products ─────────────────────────
-    async def save_product(self, bot_id: str, product_id: str, title: str, price_cents: int, stock: int, db_channel_msg_id: int, folder: str = "") -> None:
+    async def save_product(
+        self, bot_id: str, product_id: str, title: str, price_cents: int, stock: int, db_channel_msg_id: int,
+        folder: str = "", description: str = "", demo_url: str = "", active: bool = True,
+    ) -> None:
         """Stores ONLY metadata + the message_id pointer inside the owner's private DB channel."""
         doc = {
             "_id": product_id,
@@ -285,12 +288,23 @@ class NoharaDatabase:
             "stock": int(stock),  # -1 = unlimited
             "db_channel_message_id": int(db_channel_msg_id),
             "folder": folder,
+            "description": description,   # shown on the product page (optional)
+            "demo_url": demo_url,         # optional demo / preview link -> "Demo" button
+            "active": bool(active),       # False = hidden from buyers
             "created_at": _now(),
         }
         await self.products.replace_one({"_id": product_id}, doc, upsert=True)
 
-    async def list_products(self, bot_id: str) -> List[Dict[str, Any]]:
-        return await self.products.find({"bot_id": str(bot_id)}).sort("created_at", 1).to_list(length=200)
+    async def list_products(self, bot_id: str, only_active: bool = False) -> List[Dict[str, Any]]:
+        """only_active=True is what buyers see (products created before this feature count as active)."""
+        query: Dict[str, Any] = {"bot_id": str(bot_id)}
+        if only_active:
+            query["active"] = {"$ne": False}
+        return await self.products.find(query).sort("created_at", 1).to_list(length=200)
+
+    async def update_product(self, bot_id: str, product_id: str, fields: Dict[str, Any]) -> bool:
+        res = await self.products.update_one({"_id": product_id, "bot_id": str(bot_id)}, {"$set": fields})
+        return res.matched_count > 0
 
     async def add_folder(self, bot_id: str, name: str) -> str:
         folder_id = uuid.uuid4().hex[:6]
