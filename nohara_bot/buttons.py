@@ -56,6 +56,7 @@ def main_menu(
     links: Optional[Dict[str, str]] = None,
     vip_on: bool = True,
     ref_on: bool = True,
+    coupon_on: bool = True,
 ) -> Markup:
     rows = [
         [_btn("🛍 " + T("btn_view_products"), font, "primary", "menu:products")],
@@ -71,10 +72,11 @@ def main_menu(
     coupon = _btn("🎟 " + _t(T, "btn_coupon", "Redeem Coupon"), font, "success", "menu:coupon")
     topup = _btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "success", "menu:topup")
     if is_master:
-        rows.append([coupon])
+        if coupon_on:
+            rows.append([coupon])
         rows.append([_btn("🧬 " + T("btn_clone_bot"), font, "primary", "menu:clone"), topup])
     else:
-        rows.append([coupon, topup])
+        rows.append([coupon, topup] if coupon_on else [topup])
     links = links or {}
     link_row = []
     if links.get("updates_url"):
@@ -88,11 +90,20 @@ def main_menu(
     return _markup(rows)
 
 
-def vip_keyboard(T: Callable[..., str], font: str, buy_label: str) -> Markup:
-    return _markup([
-        [_btn("💎 " + buy_label, font, "primary", "vip:buy")],
-        [_btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "success", "menu:topup"), _btn("🏠 " + T("btn_home"), font, "success", "menu:home")],
-    ])
+def vip_keyboard(T: Callable[..., str], font: str, plans: List[Any], price_fmt: Callable[[int], str]) -> Markup:
+    """One button per VIP plan: (months, price_cents). Two per row."""
+    rows: List[List[Button]] = []
+    row: List[Button] = []
+    for months, cents in plans:
+        label = f"💎 {months} Month{'' if months == 1 else 's'} — {price_fmt(cents)}"
+        row.append(_btn(label, font, "primary", f"vip:buy:{months}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn("💰 " + _t(T, "btn_topup", "Top Up"), font, "success", "menu:topup"), _btn("🏠 " + T("btn_home"), font, "success", "menu:home")])
+    return _markup(rows)
 
 
 def vip_locked_keyboard(T: Callable[..., str], font: str, back_cb: str = "menu:products") -> Markup:
@@ -246,4 +257,3 @@ def upi_review_keyboard(order_id: str) -> Markup:
         _btn("Approve", "default_html", "success", f"upi:ok:{order_id}"),
         _btn("Reject", "default_html", "danger", f"upi:no:{order_id}"),
     ]])
-  

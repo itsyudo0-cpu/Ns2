@@ -127,6 +127,16 @@ class NoharaDatabase:
     async def update_clone_fields(self, bot_id: str, fields: Dict[str, Any]) -> None:
         await self.clones.update_one({"_id": str(bot_id)}, {"$set": fields})
 
+    async def get_master_clone(self) -> Optional[Dict[str, Any]]:
+        return await self.clones.find_one({"is_master": True})
+
+    async def extend_premium(self, bot_id: str, days: int) -> int:
+        """Adds Premium time to a clone (stacks on top of what is left). Returns the new expiry timestamp."""
+        doc = await self.clones.find_one({"_id": str(bot_id)}) or {}
+        until = max(_now(), int(doc.get("premium_until") or 0)) + int(days) * 86400
+        await self.clones.update_one({"_id": str(bot_id)}, {"$set": {"premium_until": until}})
+        return until
+
     async def set_link(self, bot_id: str, which: str, url: str) -> None:
         """which = 'updates' | 'support'. Empty url removes the button from the main menu."""
         await self.update_clone_fields(bot_id, {f"links.{which}_url": url})
