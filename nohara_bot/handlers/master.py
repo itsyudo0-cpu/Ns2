@@ -11,13 +11,19 @@ from hydrogram.handlers import MessageHandler
 from hydrogram.types import Message
 from typing import Any, Dict
 
-from nohara_bot.config import MASTER_AUDIT_CHANNEL_ID, MASTER_BOT_TOKEN, MAX_CLONES_PER_USER, MAX_CLONES_TOTAL
+from nohara_bot.config import (
+    FREE_CLONES_PER_USER,
+    MASTER_AUDIT_CHANNEL_ID,
+    MASTER_BOT_TOKEN,
+    MAX_CLONES_TOTAL,
+    PREMIUM_CLONES_PER_USER,
+)
 from nohara_bot.database import db
 from nohara_bot.handlers.common import _args, _is_admin
 from nohara_bot.handlers.menu import apply_command_menu
 from nohara_bot.handlers.registry import register_store_handlers
 from nohara_bot.managed import check_manager_mode, record_bot_details
-from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, MASTER, make_client
+from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, MASTER, is_premium, make_client
 
 
 log = logging.getLogger("nohara.handlers.master")
@@ -98,9 +104,12 @@ async def provision_clone(
         return {"ok": False, "error": "ℹ️ This bot is already running."}
     if not existing:
         owned = await db.get_clones_by_owner(owner_id)
-        if len(owned) >= MAX_CLONES_PER_USER and not _is_admin(owner_id):
-            return {"ok": False, "error": f"❌ You can create at most {MAX_CLONES_PER_USER} bots."}
-        if await db.count_clones() >= MAX_CLONES_TOTAL:
+        # Free users: FREE_CLONES_PER_USER bots; users with Premium on any of their bots: PREMIUM_CLONES_PER_USER
+        user_limit = PREMIUM_CLONES_PER_USER if any(is_premium(c) for c in owned) else FREE_CLONES_PER_USER
+        if len(owned) >= user_limit and not _is_admin(owner_id):
+            return {"ok": False, "error": f"❌ You can create at most {user_limit} bots."}
+        # MAX_CLONES_TOTAL = 0 means unlimited
+        if MAX_CLONES_TOTAL > 0 and await db.count_clones() >= MAX_CLONES_TOTAL:
             return {"ok": False, "error": "❌ The platform has reached its bot limit. Please try again later."}
 
     try:
