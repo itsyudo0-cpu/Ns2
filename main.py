@@ -20,6 +20,7 @@ from nohara_bot.database import db
 from nohara_bot.handlers.menu import apply_command_menu
 from nohara_bot.handlers.registry import register_store_handlers
 from nohara_bot.handlers.master import boot_clone, register_master_handlers, stop_clone_client
+from nohara_bot.managed import check_manager_mode, poll_managed_updates
 from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, MASTER, make_client
 from nohara_bot.webhooks import DynamicWebhookServer
 
@@ -54,6 +55,10 @@ async def boot_platform() -> None:
     MASTER["client"] = master_bot
     log.info("Master bot started: @%s (owner %s)", me.username, ADMIN_IDS[0])
 
+    # One-tap clone creation (Telegram Managed Bots, Bot API 9.6): listen for `managed_bot` updates
+    await check_manager_mode()
+    managed_task = asyncio.create_task(poll_managed_updates())
+
     # 3) Saved clones (one by one; failures are logged and skipped)
     started = 0
     for clone_doc in await db.get_running_clones():
@@ -65,6 +70,7 @@ async def boot_platform() -> None:
         await idle()
     finally:
         log.info("Shutting down…")
+        managed_task.cancel()
         for bot_id in list(ACTIVE_CLONE_CLIENTS.keys()):
             if bot_id != master_id:
                 await stop_clone_client(bot_id)
