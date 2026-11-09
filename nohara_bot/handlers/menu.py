@@ -83,6 +83,8 @@ OWNER_COMMANDS: List[Cmd] = [
 MASTER_OWNER_COMMANDS: List[Cmd] = [
     ("setpremium", "Set Premium price per months (clone owners)"),
     ("grantpremium", "Gift Premium months to a clone bot"),
+    ("setmasterdb", "Set the master database channel (clone records)"),
+    ("managedcheck", "Check one-tap bot creation (Managed Bots)"),
 ]
 
 _OWNER_MENU_DONE: set = set()

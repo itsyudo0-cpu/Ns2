@@ -15,16 +15,7 @@ from nohara_bot.buttons import markup
 from nohara_bot.config import APP_URL
 from nohara_bot.database import db
 from nohara_bot.fonts import FONT_MODES
-from nohara_bot.handlers.admin import (
-    ADMIN_WAIT,
-    B as bc_button,
-    BC_PENDING,
-    BC_RUNNING,
-    PROD_DRAFT,
-    _wizard_prompt,
-    open_product_dashboard,
-    screen_home,
-)
+from nohara_bot.handlers.admin import B as bc_button, BC_PENDING, BC_RUNNING, screen_home
 from nohara_bot.handlers.common import (
     DIVIDER,
     BANNER_FIELDS,
@@ -325,17 +316,6 @@ async def cmd_addproduct(client: Client, message: Message, ctx: Ctx) -> None:
         "<b>Usage:</b> send a file with the caption\n<code>/addproduct Title | 9.99 | 10 | Folder</code>\n"
         "(or reply to an already sent file with the same command). Price is in USD; stock and folder are optional (empty stock = unlimited; a new folder name is created automatically)."
     )
-    if not _rest_of_text(message):
-        # /addproduct alone -> the button based Add-Product wizard (no need to reply to a file)
-        if not ctx.clone.get("db_channel_id"):
-            await message.reply_text("Set your DB channel first: <code>/setdbchannel -100XXXXXXXXXX</code>")
-            return
-        key = (bot_id, message.from_user.id)
-        PROD_DRAFT[key] = {"step": "file"}
-        ADMIN_WAIT[key] = "padd:file"
-        text, kb = _wizard_prompt("file", {})
-        await send_ui(client, message.chat.id, text, kb)
-        return
     parts = [p.strip() for p in _rest_of_text(message).split("|")]
     if len(parts) < 2 or not parts[0]:
         await message.reply_text(usage)
@@ -372,9 +352,13 @@ async def cmd_addproduct(client: Client, message: Message, ctx: Ctx) -> None:
         caption=f"📦 <b>{html.escape(title)}</b>\n{fmt_usd(price_cents)} • ID <code>{product_id}</code>",
     )
     await db.save_product(bot_id, product_id, title, price_cents, stock, stored.id, folder_id)
-    fresh = await db.get_clone(bot_id) or ctx.clone
-    # open the product dashboard right away (edit description / demo link / stock, Active ↔ Inactive …)
-    await open_product_dashboard(client, Ctx(fresh, ctx.lang), message.chat.id, product_id, "✅ <b>Product saved!</b> Manage it below.")
+    await message.reply_text(
+        f"✅ <b>Product saved</b>\n• {html.escape(title)}\n• Price: {fmt_usd(price_cents)}\n"
+        f"• Stock: {'unlimited' if stock == -1 else stock}\n"
+        + (f"• Folder: {html.escape(parts[3])}\n" if folder_id else "")
+        + f"• ID: <code>{product_id}</code>"
+        + _link_line(ctx, product_id)
+    )
     await send_audit(
         ctx.clone,
         f"<b>[NOHARA AUDIT — ASSET UPLOAD]</b>\n• Clone Bot: <code>{html.escape(str(ctx.clone.get('bot_username', '')))}</code> (<code>{bot_id}</code>)\n"
