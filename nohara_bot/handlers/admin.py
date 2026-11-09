@@ -10,15 +10,12 @@ command to send.)
 import asyncio
 import html
 import re
-import time
-import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from hydrogram.types import CallbackQuery
 
 from nohara_bot import botapi
 from nohara_bot.buttons import btn, markup
-from nohara_bot.config import FREE_CLONES_PER_USER, PREMIUM_CLONES_PER_USER
 from nohara_bot.database import db
 from nohara_bot.fonts import FONT_MODES
 from nohara_bot.handlers.common import BANNER_FIELDS, DIVIDER, _is_owner, show
@@ -34,7 +31,6 @@ from nohara_bot.services.core import (
     product_link,
     purchase_premium,
     referral_cfg,
-    send_audit,
     send_ui,
     spawn,
     topup_tiers,
@@ -87,8 +83,7 @@ ADMIN_GUIDE = (
     "/setdbchannel <code>-100…</code> — private channel for your files\n"
     "/setlogchannel <code>-100…</code> — order log channel\n\n"
     "<b>Products &amp; folders</b>\n"
-    "📦 <b>Admin Panel → Products → ➕ Add Product</b> — step-by-step with buttons (file, title, price, description, demo link); then manage it from its dashboard (edit, stock, folder, Active/Inactive)\n"
-    "/addproduct — opens the same wizard · quick way: send a file with caption <code>/addproduct Title | 9.99 | 10 | Folder</code>\n"
+    "/addproduct <code>Title | 9.99 | 10 | Folder</code> — send with a file (stock &amp; folder optional)\n"
     "/products · /delproduct <code>ID</code>\n"
     "/addfolder <code>Name</code> · /folders · /delfolder <code>ID</code> · /setfolder <code>PRODUCT_ID FOLDER_ID</code>\n\n"
     "<b>Payments</b>\n"
@@ -156,260 +151,29 @@ async def screen_home(ctx: Ctx) -> Screen:
     return text, markup(rows)
 
 
-PAGE_SIZE = 8
-
-
-async def screen_products(ctx: Ctx, page: int = 0) -> Screen:
-    """Product list: one button per product (opens its dashboard) + the ➕ Add Product button."""
+async def screen_products(ctx: Ctx) -> Screen:
     bot_id = str(ctx.clone["_id"])
     products = await db.list_products(bot_id)
-    pages = max(1, (len(products) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = min(max(page, 0), pages - 1)
-    chunk = products[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-    rows: List[List[Dict[str, Any]]] = [[B("➕ Add Product", "adm:padd", "primary")]]
-    for p in chunk:
-        dot = "🟢" if p.get("active", True) is not False else "🔴"
-        rows.append([B(f"{dot} {p['title'][:30]} — {fmt_usd(p['price_cents'])}", f"adm:pe:{p['_id']}", "primary")])
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(B("⬅️ Prev", f"adm:products:{page - 1}"))
-        if page < pages - 1:
-            nav.append(B("Next ➡️", f"adm:products:{page + 1}"))
-        rows.append(nav)
-    active_n = sum(1 for p in products if p.get("active", True) is not False)
-    body = "<i>No products yet — tap ➕ Add Product.</i>" if not products else "<i>Tap a product to open its dashboard.</i>"
+    folders = {f["id"]: f["name"] for f in ctx.clone.get("folders") or []}
+    lines = []
+    rows: List[List[Dict[str, Any]]] = []
+    for p in products[:10]:
+        stock = "∞" if p["stock"] == -1 else p["stock"]
+        where = f" · 🗂 {esc(folders[p['folder']])}" if p.get("folder") in folders else ""
+        link = product_link(ctx.clone, p["_id"]) if is_premium(ctx.clone) else ""
+        link_line = f"\n   🔗 <code>{esc(link)}</code>" if link else ""
+        lines.append(f"• <b>{esc(p['title'])}</b> — {fmt_usd(p['price_cents'])} · stock {stock}{where}\n   <code>{p['_id']}</code>{link_line}")
+        rows.append([B(f"🗑 Delete: {p['title'][:28]}", f"adm:pdel:{p['_id']}", "danger")])
+    body = "\n".join(lines) if lines else "<i>No products yet.</i>"
+    more = f"\n<i>…and {len(products) - 10} more (see /products)</i>" if len(products) > 10 else ""
     text = (
-        f"📦 <b>PRODUCTS</b>  ·  {len(products)}  (🟢 {active_n} active · 🔴 {len(products) - active_n} hidden)\n{DIVIDER}\n{body}\n\n"
-        + ("🔗 <i>Direct buy links are in each product dashboard.</i>" if is_premium(ctx.clone) else "🔒 <i>Direct product links: Premium feature (💎 Get Premium)</i>")
+        f"📦 <b>PRODUCTS</b>  ·  {len(products)}\n{DIVIDER}\n{body}{more}\n\n"
+        f"➕ <b>Add a product</b>\nSend a file with the caption:\n<code>/addproduct Title | 9.99 | 10 | Folder</code>\n"
+        f"<i>Price in USD · stock and folder are optional</i>\n"
+        + ("🔗 <i>Each product shows its direct buy link — share it anywhere.</i>" if is_premium(ctx.clone) else "🔒 <i>Direct product links: Premium feature (💎 Get Premium)</i>")
     )
     rows.append(BACK)
     return text, markup(rows)
-
-
-# ═════════════════════════ Product dashboard + Add-Product wizard (all button based) ═════════════════════════
-# (bot_id, owner_id) -> the product being created. Steps: file -> title -> price -> description (skip) -> demo link (skip)
-PROD_DRAFT: Dict[Tuple[str, int], Dict[str, Any]] = {}
-EDIT_FIELDS = {
-    "title": ("✏️ Title", "Send the new <b>title</b> (max 60 characters)."),
-    "price": ("💵 Price", "Send the new <b>price in USD</b>, for example <code>9.99</code>."),
-    "desc": ("📝 Description", "Send the <b>description</b> buyers will see on the product page (max 800 characters)."),
-    "demo": ("🎬 Demo link", "Send the <b>demo / preview link</b> (optional) — <code>https://…</code> or <code>@channel</code>."),
-    "stock": ("📦 Stock", "Send the <b>stock</b> as a number (<code>10</code>), or <code>0</code> to mark sold out, or <code>unlimited</code>."),
-}
-
-
-def _active(p: Dict[str, Any]) -> bool:
-    return p.get("active", True) is not False
-
-
-async def screen_pedit(ctx: Ctx, product_id: str, note: str = "") -> Screen:
-    bot_id = str(ctx.clone["_id"])
-    p = await db.get_product(bot_id, product_id)
-    if not p:
-        return await screen_products(ctx)
-    folders = {f["id"]: f["name"] for f in ctx.clone.get("folders") or []}
-    stock = "∞ unlimited" if p["stock"] == -1 else str(p["stock"])
-    folder = esc(folders[p["folder"]]) if p.get("folder") in folders else "—"
-    desc = (p.get("description") or "").strip()
-    demo = (p.get("demo_url") or "").strip()
-    link = product_link(ctx.clone, p["_id"]) if is_premium(ctx.clone) else ""
-    text = (
-        (f"{note}\n\n" if note else "")
-        + f"📦 <b>PRODUCT DASHBOARD</b>\n{DIVIDER}\n"
-        f"<b>{esc(p['title'])}</b>\n"
-        f"{'🟢 <b>Active</b> — visible to buyers' if _active(p) else '🔴 <b>Inactive</b> — hidden from buyers'}\n\n"
-        f"💵 Price: <b>{fmt_usd(p['price_cents'])}</b>\n"
-        f"📦 Stock: <b>{stock}</b>\n"
-        f"🗂 Folder: <b>{folder}</b>\n"
-        f"📝 Description: {esc(desc[:300]) + ('…' if len(desc) > 300 else '') if desc else '<i>not set</i>'}\n"
-        f"🎬 Demo link: {esc(demo) if demo else '<i>not set (optional)</i>'}\n"
-        f"🆔 <code>{p['_id']}</code>"
-        + (f"\n🔗 <code>{esc(link)}</code>" if link else "")
-    )
-    pid = p["_id"]
-    rows = [
-        [B("✏️ Title", f"adm:pset:{pid}:title"), B("💵 Price", f"adm:pset:{pid}:price")],
-        [B("📝 Description", f"adm:pset:{pid}:desc"), B("🎬 Demo link", f"adm:pset:{pid}:demo")],
-        [B("📦 Stock", f"adm:pset:{pid}:stock"), B("🗂 Folder", f"adm:pfold:{pid}")],
-        [B("🔴 Deactivate" if _active(p) else "🟢 Activate", f"adm:ptog:{pid}", "danger" if _active(p) else "success")],
-        [B("🗑 Delete", f"adm:pdel:{pid}", "danger")],
-        [B("◀️ Products", "adm:products")],
-    ]
-    return text, markup(rows)
-
-
-async def screen_pfolder(ctx: Ctx, product_id: str) -> Screen:
-    folders = ctx.clone.get("folders") or []
-    rows = [[B(f"🗂 {f['name'][:30]}", f"adm:pfs:{product_id}:{f['id']}", "primary")] for f in folders]
-    rows.append([B("📦 No folder", f"adm:pfs:{product_id}:_")])
-    rows.append([B("◀️ Back", f"adm:pe:{product_id}")])
-    return f"🗂 <b>Choose a folder</b>\n{DIVIDER}\n<i>Create more folders in 🗂 Folders.</i>", markup(rows)
-
-
-def _wizard_prompt(step: str, draft: Dict[str, Any]) -> Screen:
-    """Text + keyboard of one wizard step."""
-    cancel = B("✖️ Cancel", "adm:pcancel", "danger")
-    skip = B("⏭ Skip", "adm:pskip", "primary")
-    steps = {
-        "file": ("1/5", "Send the <b>file</b> you want to sell (document, photo, video or audio).", [[cancel]]),
-        "title": ("2/5", "Send the product <b>title</b> (max 60 characters).", [[cancel]]),
-        "price": ("3/5", f"Send the <b>price in USD</b> for <b>{esc(draft.get('title', ''))}</b>, for example <code>9.99</code>.", [[cancel]]),
-        "desc": ("4/5", "Send a <b>description</b> for buyers (max 800 characters), or tap Skip.", [[skip], [cancel]]),
-        "demo": ("5/5", "Send a <b>demo / preview link</b> (optional), or tap Skip.\n<code>https://…</code> or <code>@channel</code>", [[skip], [cancel]]),
-    }
-    n, body, rows = steps[step]
-    return f"➕ <b>ADD PRODUCT</b>  ·  step {n}\n{DIVIDER}\n{body}", markup(rows)
-
-
-async def _start_wizard(client, ctx: Ctx, query: CallbackQuery) -> None:
-    bot_id, user_id = str(ctx.clone["_id"]), query.from_user.id
-    if not ctx.clone.get("db_channel_id"):
-        await query.answer("Set your files channel first:  /setdbchannel -100XXXXXXXXXX", show_alert=True)
-        return
-    PROD_DRAFT[(bot_id, user_id)] = {"step": "file"}
-    ADMIN_WAIT[(bot_id, user_id)] = "padd:file"
-    await query.answer()
-    await render(client, ctx, query, *_wizard_prompt("file", {}))
-
-
-async def _finish_wizard(client, ctx: Ctx, chat_id: int, user_id: int) -> None:
-    bot_id = str(ctx.clone["_id"])
-    key = (bot_id, user_id)
-    draft = PROD_DRAFT.pop(key, None)
-    ADMIN_WAIT.pop(key, None)
-    if not draft:
-        return
-    product_id = uuid.uuid4().hex[:8]
-    stored = await client.copy_message(
-        chat_id=int(ctx.clone["db_channel_id"]),
-        from_chat_id=draft["chat_id"],
-        message_id=draft["msg_id"],
-        caption=f"📦 <b>{esc(draft['title'])}</b>\n{fmt_usd(draft['price_cents'])} • ID <code>{product_id}</code>",
-    )
-    await db.save_product(
-        bot_id, product_id, draft["title"], draft["price_cents"], -1, stored.id, "",
-        description=draft.get("desc", ""), demo_url=draft.get("demo", ""), active=True,
-    )
-    fresh = await db.get_clone(bot_id) or ctx.clone
-    text, kb = await screen_pedit(Ctx(fresh, ctx.lang), product_id, "✅ <b>Product saved!</b> Manage it below.")
-    await send_ui(client, chat_id, text, kb)  # the dashboard opens right after adding
-    await send_audit(
-        fresh,
-        f"<b>[NOHARA AUDIT — ASSET UPLOAD]</b>\n• Clone Bot: <code>{esc(fresh.get('bot_username', ''))}</code> (<code>{bot_id}</code>)\n"
-        f"• Product: <b>{esc(draft['title'])}</b> (<code>{product_id}</code>) | DB Msg Pointer: <code>#{stored.id}</code>",
-    )
-
-
-async def open_product_dashboard(client, ctx: Ctx, chat_id: int, product_id: str, note: str = "") -> None:
-    """Used by /addproduct: after saving a product, open its dashboard."""
-    text, kb = await screen_pedit(ctx, product_id, note)
-    await send_ui(client, chat_id, text, kb)
-
-
-async def handle_product_input(client, message, ctx: Ctx) -> bool:
-    """Owner is inside the Add-Product wizard or editing a field. True = message was consumed."""
-    bot_id = str(ctx.clone["_id"])
-    user_id = message.from_user.id
-    key = (bot_id, user_id)
-    which = ADMIN_WAIT.get(key) or ""
-    if not (which.startswith("padd:") or which.startswith("pedit:")):
-        return False
-    if not _is_owner(ctx, user_id):
-        ADMIN_WAIT.pop(key, None)
-        return False
-    chat_id = message.chat.id
-    text = (message.text or "").strip()
-
-    async def ask(step: str) -> None:
-        draft = PROD_DRAFT.setdefault(key, {})
-        draft["step"] = step
-        ADMIN_WAIT[key] = f"padd:{step}"
-        t, kb = _wizard_prompt(step, draft)
-        await send_ui(client, chat_id, t, kb)
-
-    # ───── Add-Product wizard ─────
-    if which.startswith("padd:"):
-        step = which.split(":")[1]
-        draft = PROD_DRAFT.setdefault(key, {"step": step})
-        if step == "file":
-            if not message.media:
-                await message.reply_text("❌ Please send the file itself (document, photo, video or audio).")
-                return True
-            draft.update({"chat_id": message.chat.id, "msg_id": message.id})
-            await ask("title")
-        elif step == "title":
-            if not text or text.startswith("/"):
-                await message.reply_text("❌ Send the title as plain text.")
-                return True
-            draft["title"] = text[:60]
-            await ask("price")
-        elif step == "price":
-            cents = parse_usd_to_cents(text)
-            if cents is None or cents <= 0 or cents > 1_000_000:
-                await message.reply_text("❌ Invalid price. Send it in USD, for example <code>9.99</code>.")
-                return True
-            draft["price_cents"] = cents
-            await ask("desc")
-        elif step == "desc":
-            if not text or text.startswith("/"):
-                await message.reply_text("❌ Send the description as text, or tap Skip.")
-                return True
-            draft["desc"] = text[:800]
-            await ask("demo")
-        elif step == "demo":
-            url = normalize_link(text)
-            if not url:
-                await message.reply_text("❌ That does not look like a valid link. Send <code>https://…</code> or <code>@channel</code>, or tap Skip.")
-                return True
-            draft["demo"] = url
-            await _finish_wizard(client, ctx, chat_id, user_id)
-        return True
-
-    # ───── Editing one field of an existing product ─────
-    _, product_id, field = (which.split(":") + ["", ""])[:3]
-    product = await db.get_product(bot_id, product_id)
-    if not product or field not in EDIT_FIELDS:
-        ADMIN_WAIT.pop(key, None)
-        return False
-    update: Dict[str, Any] = {}
-    if field == "title":
-        if not text or text.startswith("/"):
-            await message.reply_text("❌ Send the title as plain text.")
-            return True
-        update["title"] = text[:60]
-    elif field == "price":
-        cents = parse_usd_to_cents(text)
-        if cents is None or cents <= 0 or cents > 1_000_000:
-            await message.reply_text("❌ Invalid price. Send it in USD, for example <code>9.99</code>.")
-            return True
-        update["price_cents"] = cents
-    elif field == "desc":
-        if not text or text.startswith("/"):
-            await message.reply_text("❌ Send the description as text.")
-            return True
-        update["description"] = text[:800]
-    elif field == "demo":
-        url = normalize_link(text)
-        if not url:
-            await message.reply_text("❌ That does not look like a valid link. Send <code>https://…</code> or <code>@channel</code>.")
-            return True
-        update["demo_url"] = url
-    elif field == "stock":
-        low = text.lower()
-        if low in ("unlimited", "inf", "∞", "-1", "u"):
-            update["stock"] = -1
-        elif low.isdigit() and int(low) <= 10_000_000:
-            update["stock"] = int(low)
-        else:
-            await message.reply_text("❌ Send a number like <code>10</code>, <code>0</code> for sold out, or <code>unlimited</code>.")
-            return True
-    ADMIN_WAIT.pop(key, None)
-    await db.update_product(bot_id, product_id, update)
-    fresh = await db.get_clone(bot_id) or ctx.clone
-    t, kb = await screen_pedit(Ctx(fresh, ctx.lang), product_id, "✅ <b>Saved.</b>")
-    await send_ui(client, chat_id, t, kb)
-    return True
 
 
 async def screen_folders(ctx: Ctx) -> Screen:
@@ -739,49 +503,6 @@ async def screen_prem(ctx: Ctx, user_id: int = 0, note: str = "") -> Screen:
     return text, markup(rows)
 
 
-async def screen_prem_confirm(ctx: Ctx, user_id: int, months: int) -> Screen:
-    """Confirmation page: plan, price, wallet, validity and the features it unlocks. Payment happens only on ✅ Confirm."""
-    clone = ctx.clone
-    master = await db.get_master_clone() or {}
-    price = dict(plans_from(master.get("premium_plans"))).get(int(months))
-    if not price:
-        return await screen_prem(ctx, user_id, "❌ This plan is not available.")
-    balance = await db.get_balance(str(master.get("_id", "")), user_id) if master else 0
-    current_until = int(clone.get("premium_until") or 0)
-    renewing = current_until > int(time.time())
-    new_until = max(int(time.time()), current_until) + int(months) * 30 * 86400
-    per_month = fmt_usd(int(price) // int(months)) if months > 1 else ""
-    can_pay = balance >= int(price)
-    text = (
-        f"💎 <b>CONFIRM PREMIUM</b>\n{DIVIDER}\n"
-        f"🗓 Plan: <b>{month_label(months)}</b>\n"
-        f"💵 Price: <b>{fmt_usd(int(price))}</b>" + (f"  <i>(≈ {per_month}/month)</i>" if per_month else "") + "\n"
-        f"⏳ {'Extends Premium until' if renewing else 'Premium active until'}: <b>{fmt_date(new_until)}</b>\n"
-        f"👛 Wallet: <b>{fmt_usd(balance)}</b>"
-        + (f"  →  after payment <b>{fmt_usd(balance - int(price))}</b>" if can_pay else "") + "\n\n"
-        f"<b>✨ What you get with {month_label(months)} of Premium</b>\n"
-        f"• 💎 <b>VIP Membership</b> — sell VIP to your buyers with your own 1–12 month plans &amp; discount %\n"
-        f"• 🎁 <b>Refer &amp; Earn</b> — wallet bonus for every friend your buyers invite\n"
-        f"• 🎟 <b>Coupons</b> — discount codes with usage limit and expiry\n"
-        f"• 🔒 <b>VIP-only products</b> — keep selected products for VIP members\n"
-        f"• 🔗 <b>Direct product links</b> — share a buy page for any product\n"
-        f"• 🧬 <b>Up to {PREMIUM_CLONES_PER_USER} bots</b> from one account (free accounts: {FREE_CLONES_PER_USER})\n\n"
-    )
-    if can_pay:
-        text += "⚠️ <b>Your wallet is charged only when you tap “Confirm &amp; Pay”.</b>"
-    else:
-        text += f"❌ <b>Not enough balance</b> — you need {fmt_usd(int(price) - balance)} more. Top up in the master bot first."
-    rows: List[List[Dict[str, Any]]] = []
-    if can_pay:
-        rows.append([B("✅ Confirm & Pay", f"adm:premok:{months}", "success")])
-    else:
-        username = str(master.get("bot_username", "")).lstrip("@")
-        if username:
-            rows.append([btn("💰 Top Up in master bot", FONT, "primary", url=f"https://t.me/{username}")])
-    rows.append([B("✖️ Cancel", "adm:prem", "danger")])
-    return text, markup(rows)
-
-
 # ═════════════════════════ Premium features screens ═════════════════════════
 async def screen_premium(ctx: Ctx) -> Screen:
     clone = ctx.clone
@@ -894,87 +615,6 @@ async def handle_admin_callback(client, query: CallbackQuery, ctx: Ctx, parts: L
     arg = parts[2] if len(parts) > 2 else ""
     note = ""
 
-    # ───── Products: list, Add-Product wizard, per-product dashboard ─────
-    if section == "products":
-        await query.answer()
-        await render(client, ctx, query, *await screen_products(ctx, int(arg) if arg.isdigit() else 0))
-        return
-    if section == "padd":
-        await _start_wizard(client, ctx, query)
-        return
-    if section == "pcancel":
-        PROD_DRAFT.pop((bot_id, user_id), None)
-        ADMIN_WAIT.pop((bot_id, user_id), None)
-        await query.answer("Cancelled")
-        await render(client, ctx, query, *await screen_products(ctx))
-        return
-    if section == "pskip":
-        draft = PROD_DRAFT.get((bot_id, user_id)) or {}
-        step = draft.get("step")
-        if step == "desc":
-            draft["step"] = "demo"
-            ADMIN_WAIT[(bot_id, user_id)] = "padd:demo"
-            await query.answer()
-            await render(client, ctx, query, *_wizard_prompt("demo", draft))
-        elif step == "demo":
-            await query.answer("Saving…")
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            await _finish_wizard(client, ctx, query.message.chat.id, user_id)
-        else:
-            await query.answer("Nothing to skip.", show_alert=True)
-        return
-    if section == "pe":
-        await query.answer()
-        await render(client, ctx, query, *await screen_pedit(ctx, arg))
-        return
-    if section == "pset" and len(parts) > 3 and parts[3] in EDIT_FIELDS:
-        if not await db.get_product(bot_id, arg):
-            await query.answer("Product not found", show_alert=True)
-            return
-        field = parts[3]
-        ADMIN_WAIT[(bot_id, user_id)] = f"pedit:{arg}:{field}"
-        await query.answer()
-        label, ask_text = EDIT_FIELDS[field]
-        rows = [[B("✖️ Cancel", f"adm:pe:{arg}", "danger")]]
-        if field in ("desc", "demo"):
-            rows.insert(0, [B("🗑 Remove it", f"adm:pclr:{arg}:{field}", "danger")])
-        await render(client, ctx, query, f"{label}\n{DIVIDER}\n{ask_text}", markup(rows))
-        return
-    if section == "pclr" and len(parts) > 3 and parts[3] in ("desc", "demo"):
-        await db.update_product(bot_id, arg, {"description" if parts[3] == "desc" else "demo_url": ""})
-        await query.answer("Removed")
-        await render(client, ctx, query, *await screen_pedit(ctx, arg))
-        return
-    if section == "ptog":
-        product = await db.get_product(bot_id, arg)
-        if not product:
-            await query.answer("Product not found", show_alert=True)
-            return
-        now_active = not _active(product)
-        await db.update_product(bot_id, arg, {"active": now_active})
-        await query.answer("🟢 Activated — buyers can see it" if now_active else "🔴 Deactivated — hidden from buyers")
-        await render(client, ctx, query, *await screen_pedit(ctx, arg))
-        return
-    if section == "pfold":
-        if not (ctx.clone.get("folders") or []):
-            await query.answer("Create a folder first (🗂 Folders on the Admin Panel).", show_alert=True)
-            return
-        await query.answer()
-        await render(client, ctx, query, *await screen_pfolder(ctx, arg))
-        return
-    if section == "pfs" and len(parts) > 3:
-        folder_id = "" if parts[3] == "_" else parts[3]
-        if folder_id and folder_id not in {f["id"] for f in ctx.clone.get("folders") or []}:
-            await query.answer("Folder not found", show_alert=True)
-            return
-        await db.set_product_folder(bot_id, arg, folder_id)
-        await query.answer("Folder updated")
-        await render(client, ctx, query, *await screen_pedit(ctx, arg))
-        return
-
     if section == "pdel":  # confirmation screen
         product = await db.get_product(bot_id, arg)
         await query.answer()
@@ -1031,14 +671,7 @@ async def handle_admin_callback(client, query: CallbackQuery, ctx: Ctx, parts: L
         await query.answer()
         await render(client, ctx, query, *await screen_prem(ctx, user_id))
         return
-    elif section == "prembuy" and arg.isdigit():  # step 1: show what the buyer gets — NOTHING is charged yet
-        if ctx.is_master:
-            await query.answer("The master store already has every feature.", show_alert=True)
-            return
-        await query.answer()
-        await render(client, ctx, query, *await screen_prem_confirm(ctx, user_id, int(arg)))
-        return
-    elif section == "premok" and arg.isdigit():  # step 2: the buyer tapped ✅ Confirm
+    elif section == "prembuy" and arg.isdigit():
         if ctx.is_master:
             await query.answer("The master store already has every feature.", show_alert=True)
             return
